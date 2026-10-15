@@ -1,0 +1,139 @@
+@prefix cr: <http://lblod.data.gift/vocabularies/change-requests/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix dct: <http://purl.org/dc/terms/> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix org: <http://www.w3.org/ns/org#> .
+@prefix melding: <https://data.vlaanderen.be/ns/melding#> .
+
+# The terms change-request-service mints. Everything else it writes reuses existing terms:
+#   request   adms:status, dct:created, pav:createdBy (the requesting organisation), dct:creator
+#             (the person), dct:isReplacedBy (the newer request that replaced it)
+#   action    dct:isPartOf (its request), dct:type, adms:status (of the request after it),
+#             schema:position, prov:startedAtTime, prov:wasAssociatedWith (a foaf:Person or the
+#             service), dct:description (the reason), task:error (an oslc:Error), prov:generated
+#             (its versions), prov:invalidated (the record states it replaced)
+#   version   dct:isVersionOf, prov:generatedAtTime, and the record's own predicates
+#   state     dct:isVersionOf, and the record's own predicates
+#   link      rdf:subject, rdf:predicate, rdf:object (an rdf:Statement)
+# The two code lists (status, action type) are SKOS concept schemes under lblod.data.gift.
+
+cr: a owl:Ontology ;
+  rdfs:label "Change requests"@en, "Wijzigingsaanvragen"@nl ;
+  rdfs:comment "Requests to change records about an organisation, the steps taken on them and the states of the records they started from and replaced."@en ;
+  dct:creator <http://lblod.data.gift/services/change-request-service> .
+
+# --- Classes ------------------------------------------------------------------------------
+
+cr:ChangeRequest a rdfs:Class, owl:Class ;
+  rdfs:label "Change request"@en, "Wijzigingsaanvraag"@nl ;
+  rdfs:comment "A request to create, change or delete records about an organisation, submitted by or for an organisation and decided on by ABB or by a rule. Its adms:status repeats the status after its last action."@en ;
+  rdfs:subClassOf prov:Entity ;
+  rdfs:seeAlso melding:Terugmelding ;
+  rdfs:isDefinedBy cr: .
+
+cr:Action a rdfs:Class, owl:Class ;
+  rdfs:label "Change request action"@en, "Handeling op een wijzigingsaanvraag"@nl ;
+  rdfs:comment "Something done to a change request: its submission, approval, rejection, withdrawal or re-application. It points at its request with dct:isPartOf; its adms:status is the status of the request after it."@en ;
+  rdfs:subClassOf prov:Activity ;
+  rdfs:isDefinedBy cr: .
+
+cr:ProposedVersion a rdfs:Class, owl:Class ;
+  rdfs:label "Proposed version"@en, "Voorgestelde versie"@nl ;
+  rdfs:comment "The proposed state of one record within a change request: only the keys it changes, with the record's own predicates, relationships pointing at record URIs. A proposal may never be applied; it is not a version in the sense of an event stream and never carries the record's type."@en ;
+  rdfs:subClassOf prov:Entity ;
+  rdfs:isDefinedBy cr: .
+
+cr:RecordState a rdfs:Class, owl:Class ;
+  rdfs:label "Record state"@en, "Toestand van een record"@nl ;
+  rdfs:comment "The values some keys of a record had at one moment, with the record's own predicates (no triple for a key that was empty), and for a deleted record the links that pointed at it: the state a proposed version started from (cr:base) or the state an action replaced when it applied a request (prov:invalidated)."@en ;
+  rdfs:subClassOf prov:Entity ;
+  rdfs:isDefinedBy cr: .
+
+cr:ChangeRequestStatus a rdfs:Class, owl:Class ;
+  rdfs:label "Change request status"@en, "Status van een wijzigingsaanvraag"@nl ;
+  rdfs:comment "A concept of the code list of the statuses of a change request."@en ;
+  rdfs:subClassOf skos:Concept ;
+  rdfs:isDefinedBy cr: .
+
+cr:ActionType a rdfs:Class, owl:Class ;
+  rdfs:label "Change request action type"@en, "Type van een handeling op een wijzigingsaanvraag"@nl ;
+  rdfs:comment "A concept of the code list of the types of a change request action."@en ;
+  rdfs:subClassOf skos:Concept ;
+  rdfs:isDefinedBy cr: .
+
+# --- Properties ---------------------------------------------------------------------------
+
+cr:target a rdf:Property, owl:ObjectProperty ;
+  rdfs:label "target"@en, "onderwerp"@nl ;
+  rdfs:comment "The organisation a change request is about."@en ;
+  rdfs:domain cr:ChangeRequest ;
+  rdfs:range org:Organization ;
+  rdfs:subPropertyOf dct:subject ;
+  rdfs:isDefinedBy cr: .
+
+cr:aggregate a rdf:Property, owl:DatatypeProperty ;
+  rdfs:label "aggregate"@en, "aggregaat"@nl ;
+  rdfs:comment "The service configuration key of the group of records a change request changes, such as organization-core-data or site."@en ;
+  rdfs:domain cr:ChangeRequest ;
+  rdfs:range xsd:string ;
+  rdfs:isDefinedBy cr: .
+
+cr:actingOrganisation a rdf:Property, owl:ObjectProperty ;
+  rdfs:label "acting organisation"@en, "handelende organisatie"@nl ;
+  rdfs:comment "The organisation on whose behalf the person took the action. prov:actedOnBehalfOf would say this of the agent, for all its activities; this says it of one action."@en ;
+  rdfs:domain cr:Action ;
+  rdfs:range org:Organization ;
+  rdfs:isDefinedBy cr: .
+
+cr:rule a rdf:Property, owl:DatatypeProperty ;
+  rdfs:label "rule"@en, "regel"@nl ;
+  rdfs:comment "The name of the policy rule that allowed or took the action, such as own-organisation or abb-decides-all."@en ;
+  rdfs:domain cr:Action ;
+  rdfs:range xsd:string ;
+  rdfs:isDefinedBy cr: .
+
+cr:masterUuid a rdf:Property, owl:DatatypeProperty ;
+  rdfs:label "master uuid"@en, "uuid van het record"@nl ;
+  rdfs:comment "The mu:uuid of the record a proposed version is about, also when that record does not exist (yet, or any more)."@en ;
+  rdfs:domain cr:ProposedVersion ;
+  rdfs:range xsd:string ;
+  rdfs:isDefinedBy cr: .
+
+cr:resourceType a rdf:Property, owl:DatatypeProperty ;
+  rdfs:label "resource type"@en, "resourcetype"@nl ;
+  rdfs:comment "The JSON:API type of the record a proposed version is about, in the resources model of the application."@en ;
+  rdfs:domain cr:ProposedVersion ;
+  rdfs:range xsd:string ;
+  rdfs:isDefinedBy cr: .
+
+cr:operation a rdf:Property, owl:ObjectProperty ;
+  rdfs:label "operation"@en, "bewerking"@nl ;
+  rdfs:comment "What a proposed version does to its record: as:Create, as:Update or as:Delete, the markers LDES uses, here as values so the version does not become an activity."@en ;
+  rdfs:domain cr:ProposedVersion ;
+  rdfs:isDefinedBy cr: .
+
+cr:changesProperty a rdf:Property, owl:ObjectProperty ;
+  rdfs:label "changes property"@en, "wijzigt eigenschap"@nl ;
+  rdfs:comment "A predicate whose values a proposed version replaces on its record (a set merges): with its triples it gives every key the version changes, also one it empties."@en ;
+  rdfs:domain cr:ProposedVersion ;
+  rdfs:range rdf:Property ;
+  rdfs:isDefinedBy cr: .
+
+cr:base a rdf:Property, owl:ObjectProperty ;
+  rdfs:label "base"@en, "uitgangstoestand"@nl ;
+  rdfs:comment "The state of the record a proposed version started from: the values the form showed for the keys it changes."@en ;
+  rdfs:domain cr:ProposedVersion ;
+  rdfs:range cr:RecordState ;
+  rdfs:subPropertyOf prov:wasDerivedFrom ;
+  rdfs:isDefinedBy cr: .
+
+cr:incomingLink a rdf:Property, owl:ObjectProperty ;
+  rdfs:label "incoming link"@en, "inkomende link"@nl ;
+  rdfs:comment "A link that pointed at the record of a record state at that moment, as an rdf:Statement with the record as rdf:object; kept for a deleted record."@en ;
+  rdfs:domain cr:RecordState ;
+  rdfs:range rdf:Statement ;
+  rdfs:isDefinedBy cr: .
