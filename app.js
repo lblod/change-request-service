@@ -3,7 +3,7 @@ import bodyParser from 'body-parser';
 import { MODEL_DIR, CONFIG_FILE, APPLICATION_GRAPH, CHANGE_REQUESTS_GRAPH } from './constants.js';
 import { loadModel } from './lib/model.js';
 import { loadConfig } from './lib/config.js';
-import { createService } from './lib/change-requests.js';
+import { createService, parseListQuery, pageLinks } from './lib/change-requests.js';
 import { requireSession } from './lib/session.js';
 import { HttpError } from './lib/errors.js';
 
@@ -41,11 +41,13 @@ app.get('/change-requests/permissions', async (req, res, next) => {
   }
 });
 
+// One page of requests: ?filter[target]=<uuid>&filter[status]=ingediend&page[number]=0&page[size]=20
 app.get('/change-requests', async (req, res, next) => {
   try {
     const session = await requireSession(db, req);
-    const target = req.query.filter?.target;
-    res.status(200).json({ data: await service.list(session, typeof target === 'string' ? target : undefined) });
+    const query = parseListQuery(req.query);
+    const { documents, count } = await service.list(session, query);
+    res.status(200).json({ data: documents, meta: { count }, links: pageLinks(query, count) });
   } catch (error) {
     next(error);
   }
@@ -70,7 +72,18 @@ app.post('/change-requests', bodyParser.json({ type: 'application/json', limit: 
   }
 });
 
-// Applies the stored versions of a failed request (status mislukt) again.
+// A step on an existing request: goedkeuring, afkeuring, intrekking or hertoepassing.
+app.post('/change-requests/:id/steps', bodyParser.json({ type: 'application/json', limit: bodyLimit }), async (req, res, next) => {
+  try {
+    const session = await requireSession(db, req);
+    const { status, document } = await service.addStep(session, req.params.id, req.body);
+    res.status(status).json({ data: document });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Applies the stored versions of a failed request (status mislukt) again: a hertoepassing step.
 app.post('/change-requests/:id/apply', async (req, res, next) => {
   try {
     const session = await requireSession(db, req);

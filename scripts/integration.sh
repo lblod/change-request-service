@@ -158,7 +158,7 @@ if [ -n "$SITE_UUID" ]; then
           ?org mu:uuid \"$ORG_A_UUID\" ; org:hasSite ?site . }" true
   check_data "organisation A carries dct:modified and ext:lastModifiedBy" "
     PREFIX dct: <http://purl.org/dc/terms/> PREFIX ext: <http://mu.semte.ch/vocabularies/ext/> PREFIX mu: <http://mu.semte.ch/vocabularies/core/>
-    ASK { ?org mu:uuid \"$ORG_A_UUID\" ; dct:modified ?when ; ext:lastModifiedBy ?account . }" true
+    ASK { ?org mu:uuid \"$ORG_A_UUID\" ; dct:modified ?when ; ext:lastModifiedBy ?person . }" true
   if [ -n "$SITE_TYPE_UUID" ]; then
     check_data "the site carries its site type (a reference of the aggregate)" "
       PREFIX ere: <http://data.lblod.info/vocabularies/erediensten/> PREFIX mu: <http://mu.semte.ch/vocabularies/core/>
@@ -313,7 +313,8 @@ if [ -n "$SITE_UUID" ]; then
           UNION { ?org mu:uuid \"$ORG_A_UUID\" ; org:hasSite <http://data.lblod.info/id/vestigingen/$SITE_UUID> . } }" false
   check_data "the versions keep their link to the deleted site" "
     PREFIX dct: <http://purl.org/dc/terms/> PREFIX cr: <http://lblod.data.gift/vocabularies/change-requests/>
-    ASK { ?version a cr:Version ; dct:isVersionOf <http://data.lblod.info/id/vestigingen/$SITE_UUID> ; cr:deleted true ; cr:operation \"delete\" . }" true
+    PREFIX as: <https://www.w3.org/ns/activitystreams#>
+    ASK { ?version a cr:ProposedVersion ; dct:isVersionOf <http://data.lblod.info/id/vestigingen/$SITE_UUID> ; cr:operation as:Delete . }" true
 fi
 
 # --- ABB edits organisation B -----------------------------------------------------------------

@@ -4,27 +4,30 @@ PREFIX ext: <http://mu.semte.ch/vocabularies/ext/>
 PREFIX session: <http://mu.semte.ch/vocabularies/session/>
 PREFIX cr: <http://lblod.data.gift/vocabularies/change-requests/>
 PREFIX dct: <http://purl.org/dc/terms/>
+PREFIX pav: <http://purl.org/pav/>
 PREFIX adms: <http://www.w3.org/ns/adms#>
 PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX schema: <http://schema.org/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX task: <http://redpencil.data.gift/vocabularies/tasks/>
+PREFIX oslc: <http://open-services.net/ns/core#>
+PREFIX as: <https://www.w3.org/ns/activitystreams#>
 PREFIX org: <http://www.w3.org/ns/org#>
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 
 DELETE {
-  GRAPH <http://mu.semte.ch/application> { ?s ?p ?o . }
+  GRAPH <http://mu.semte.ch/application> {
+    ?s ?p ?o .
+    <http://data.lblod.info/id/vestigingen/77c2a4b6-1d3e-4f5a-8b9c-0d1e2f3a4b5c> <http://www.w3.org/ns/org#siteAddress> <http://data.lblod.info/id/contact-punten/c0ffee12-3456-4789-8abc-def012345678> .
+    <http://data.lblod.info/id/bestuurseenheden/9a01f3e2-4c7b-4d2a-9f1e-0a1b2c3d4e5f> <http://www.w3.org/ns/org#hasSite> <http://data.lblod.info/id/vestigingen/77c2a4b6-1d3e-4f5a-8b9c-0d1e2f3a4b5c> .
+  }
   GRAPH <http://mu.semte.ch/graphs/change-requests> {
-    <http://data.lblod.info/id/change-requests/00000000-0000-4000-8000-000000000001> adms:status ?oldStatus ;
-      cr:appliedAt ?oldAppliedAt ;
-      cr:error ?oldError .
+    <http://data.lblod.info/id/change-requests/00000000-0000-4000-8000-000000000001> adms:status ?oldStatus .
   }
 }
 INSERT {
   GRAPH <http://mu.semte.ch/application> {
-    <http://data.lblod.info/id/adressen/4b6e8d0f-2a4c-4e6f-8a0b-2c4d6e8f0a1b> <http://www.w3.org/ns/locn#thoroughfare> """Grote Markt""" ;
-      <https://data.vlaanderen.be/ns/adres#Adresvoorstelling.huisnummer> """3""" ;
-      <http://www.w3.org/ns/locn#postCode> """9300""" ;
-      <https://data.vlaanderen.be/ns/adres#gemeentenaam> """Aalst""" ;
-      <http://www.w3.org/ns/locn#adminUnitL2> """Oost-Vlaanderen""" ;
-      <https://data.vlaanderen.be/ns/adres#land> """België""" ;
+    <http://data.lblod.info/id/adressen/4b6e8d0f-2a4c-4e6f-8a0b-2c4d6e8f0a1b> <https://data.vlaanderen.be/ns/adres#Adresvoorstelling.huisnummer> """3""" ;
       <http://www.w3.org/ns/locn#fullAddress> """Grote Markt 3, 9300 Aalst, België""" ;
       <https://data.vlaanderen.be/ns/adres#verwijstNaar> <https://data.vlaanderen.be/id/adres/123456> .
     <http://data.lblod.info/id/contact-punten/00000000-0000-4000-8000-000000000002> a <http://schema.org/ContactPoint> ;
@@ -33,56 +36,75 @@ INSERT {
       <http://schema.org/telephone> """+32 53 77 93 00""" ;
       <http://schema.org/contactType> """Primary""" ;
       <http://www.w3.org/ns/locn#address> <http://data.lblod.info/id/adressen/4b6e8d0f-2a4c-4e6f-8a0b-2c4d6e8f0a1b> .
-    <http://data.lblod.info/id/vestigingen/77c2a4b6-1d3e-4f5a-8b9c-0d1e2f3a4b5c> <https://data.vlaanderen.be/ns/organisatie#bestaatUit> <http://data.lblod.info/id/adressen/4b6e8d0f-2a4c-4e6f-8a0b-2c4d6e8f0a1b> ;
-      <http://www.w3.org/ns/org#siteAddress> <http://data.lblod.info/id/contact-punten/00000000-0000-4000-8000-000000000002> ;
+    <http://data.lblod.info/id/vestigingen/77c2a4b6-1d3e-4f5a-8b9c-0d1e2f3a4b5c> <http://www.w3.org/ns/org#siteAddress> <http://data.lblod.info/id/contact-punten/00000000-0000-4000-8000-000000000002> ;
       <http://data.lblod.info/vocabularies/erediensten/vestigingstype> <http://lblod.data.gift/concepts/dcc01338-842c-4fbd-ba68-3ca6f3af975c> .
-    <http://data.lblod.info/id/gestructureerdeIdentificatoren/2e4a6c8e-0b1d-4f3a-9c5e-7a9c1e3a5c7e> <https://data.vlaanderen.be/ns/generiek#lokaleIdentificator> """0207437468""" .
-    <http://data.lblod.info/id/bestuurseenheden/9a01f3e2-4c7b-4d2a-9f1e-0a1b2c3d4e5f> <http://www.w3.org/2004/02/skos/core#prefLabel> """Stad Aalst""" ;
-      <http://www.w3.org/2004/02/skos/core#altLabel> """Aalst""" ;
-      <http://www.w3.org/ns/org#hasPrimarySite> <http://data.lblod.info/id/vestigingen/77c2a4b6-1d3e-4f5a-8b9c-0d1e2f3a4b5c> ;
-      <http://www.w3.org/ns/adms#identifier> <http://data.lblod.info/id/identificatoren/1d3f5a7c-9e0b-4d2f-8a4c-6e8a0c2e4a6c> .
+    <http://data.lblod.info/id/bestuurseenheden/9a01f3e2-4c7b-4d2a-9f1e-0a1b2c3d4e5f> <http://www.w3.org/2004/02/skos/core#prefLabel> """Stad Aalst""" .
     <http://data.lblod.info/id/bestuurseenheden/9a01f3e2-4c7b-4d2a-9f1e-0a1b2c3d4e5f> dct:modified "2026-11-03T10:12:01.000Z"^^xsd:dateTime ;
-      ext:lastModifiedBy <http://data.lblod.info/id/account/5f1c2a3b-7d8e-4f90-a1b2-c3d4e5f60718> .
+      ext:lastModifiedBy <http://data.lblod.info/id/persoon/1e2f3a4b-5c6d-4e7f-8a9b-0c1d2e3f4a5b> .
   }
   GRAPH <http://mu.semte.ch/graphs/change-requests> {
-    <http://data.lblod.info/id/change-requests/00000000-0000-4000-8000-000000000001> adms:status <http://lblod.data.gift/concepts/change-request-status/goedgekeurd> ;
-      cr:appliedAt "2026-11-03T10:12:01.000Z"^^xsd:dateTime .
+    <http://data.lblod.info/id/change-requests/00000000-0000-4000-8000-000000000001> adms:status <http://lblod.data.gift/concepts/ca080d1f-f71c-4fe6-a4ed-a13fe1112989> .
+    <http://data.lblod.info/id/change-request-actions/00000000-0000-4000-8000-000000000015> a cr:Action ;
+      mu:uuid """00000000-0000-4000-8000-000000000015""" ;
+      dct:isPartOf <http://data.lblod.info/id/change-requests/00000000-0000-4000-8000-000000000001> ;
+      dct:type <http://lblod.data.gift/concepts/bb2bb632-fc9f-41c6-a1eb-8f50e4008551> ;
+      adms:status <http://lblod.data.gift/concepts/ca080d1f-f71c-4fe6-a4ed-a13fe1112989> ;
+      schema:position "2"^^xsd:integer ;
+      prov:startedAtTime "2026-11-03T10:12:01.000Z"^^xsd:dateTime ;
+      prov:wasAssociatedWith <http://lblod.data.gift/services/change-request-service> ;
+      cr:rule """always""" ;
+      prov:invalidated <http://data.lblod.info/id/record-states/00000000-0000-4000-8000-000000000016>, <http://data.lblod.info/id/record-states/00000000-0000-4000-8000-000000000017>, <http://data.lblod.info/id/record-states/00000000-0000-4000-8000-000000000018>, <http://data.lblod.info/id/record-states/00000000-0000-4000-8000-000000000019> .
+    <http://data.lblod.info/id/record-states/00000000-0000-4000-8000-000000000016> a cr:RecordState ;
+      mu:uuid """00000000-0000-4000-8000-000000000016""" ;
+      dct:isVersionOf <http://data.lblod.info/id/adressen/4b6e8d0f-2a4c-4e6f-8a0b-2c4d6e8f0a1b> ;
+      <http://www.w3.org/ns/locn#fullAddress> """Grote Markt 1, 9300 Aalst, België""" ;
+      <https://data.vlaanderen.be/ns/adres#Adresvoorstelling.huisnummer> """1""" ;
+      <https://data.vlaanderen.be/ns/adres#verwijstNaar> <https://data.vlaanderen.be/id/adres/123455> .
+    <http://data.lblod.info/id/record-states/00000000-0000-4000-8000-000000000017> a cr:RecordState ;
+      mu:uuid """00000000-0000-4000-8000-000000000017""" ;
+      dct:isVersionOf <http://data.lblod.info/id/vestigingen/77c2a4b6-1d3e-4f5a-8b9c-0d1e2f3a4b5c> ;
+      <http://www.w3.org/ns/org#siteAddress> <http://data.lblod.info/id/contact-punten/c0ffee12-3456-4789-8abc-def012345678> .
+    <http://data.lblod.info/id/record-states/00000000-0000-4000-8000-000000000018> a cr:RecordState ;
+      mu:uuid """00000000-0000-4000-8000-000000000018""" ;
+      dct:isVersionOf <http://data.lblod.info/id/bestuurseenheden/9a01f3e2-4c7b-4d2a-9f1e-0a1b2c3d4e5f> ;
+      <http://data.vlaanderen.be/ns/besluit#werkingsgebied> <http://data.lblod.info/id/werkingsgebieden/a2f6c8e0-4b1d-4e3f-9a5c-7e9b1d3f5a7c> ;
+      <http://www.w3.org/2004/02/skos/core#prefLabel> """Aalst""" ;
+      <http://www.w3.org/ns/org#hasSite> <http://data.lblod.info/id/vestigingen/77c2a4b6-1d3e-4f5a-8b9c-0d1e2f3a4b5c> .
+    <http://data.lblod.info/id/record-states/00000000-0000-4000-8000-000000000019> a cr:RecordState ;
+      mu:uuid """00000000-0000-4000-8000-000000000019""" ;
+      dct:isVersionOf <http://data.lblod.info/id/contact-punten/c0ffee12-3456-4789-8abc-def012345678> ;
+      cr:incomingLink <http://data.lblod.info/id/record-links/00000000-0000-4000-8000-000000000020> .
+    <http://data.lblod.info/id/record-links/00000000-0000-4000-8000-000000000020> a rdf:Statement ;
+      mu:uuid """00000000-0000-4000-8000-000000000020""" ;
+      rdf:subject <http://data.lblod.info/id/vestigingen/77c2a4b6-1d3e-4f5a-8b9c-0d1e2f3a4b5c> ;
+      rdf:predicate <http://www.w3.org/ns/org#siteAddress> ;
+      rdf:object <http://data.lblod.info/id/contact-punten/c0ffee12-3456-4789-8abc-def012345678> .
   }
 }
 WHERE {
+  {
+    GRAPH <http://mu.semte.ch/graphs/change-requests> { <http://data.lblod.info/id/change-requests/00000000-0000-4000-8000-000000000001> a cr:ChangeRequest . }
+  }
+  UNION
   {
     GRAPH <http://mu.semte.ch/graphs/change-requests> { <http://data.lblod.info/id/change-requests/00000000-0000-4000-8000-000000000001> adms:status ?oldStatus . }
   }
   UNION
   {
-    GRAPH <http://mu.semte.ch/graphs/change-requests> { <http://data.lblod.info/id/change-requests/00000000-0000-4000-8000-000000000001> cr:appliedAt ?oldAppliedAt . }
-  }
-  UNION
-  {
-    GRAPH <http://mu.semte.ch/graphs/change-requests> { <http://data.lblod.info/id/change-requests/00000000-0000-4000-8000-000000000001> cr:error ?oldError . }
-  }
-  UNION
-  {
     VALUES ?s { <http://data.lblod.info/id/adressen/4b6e8d0f-2a4c-4e6f-8a0b-2c4d6e8f0a1b> }
-    VALUES ?p { <http://purl.org/dc/terms/source> <http://www.w3.org/ns/locn#adminUnitL2> <http://www.w3.org/ns/locn#fullAddress> <http://www.w3.org/ns/locn#postCode> <http://www.w3.org/ns/locn#thoroughfare> <https://data.vlaanderen.be/ns/adres#Adresvoorstelling.busnummer> <https://data.vlaanderen.be/ns/adres#Adresvoorstelling.huisnummer> <https://data.vlaanderen.be/ns/adres#gemeentenaam> <https://data.vlaanderen.be/ns/adres#land> <https://data.vlaanderen.be/ns/adres#verwijstNaar> }
+    VALUES ?p { <http://www.w3.org/ns/locn#fullAddress> <https://data.vlaanderen.be/ns/adres#Adresvoorstelling.huisnummer> <https://data.vlaanderen.be/ns/adres#verwijstNaar> }
     GRAPH <http://mu.semte.ch/application> { ?s ?p ?o . }
   }
   UNION
   {
     VALUES ?s { <http://data.lblod.info/id/vestigingen/77c2a4b6-1d3e-4f5a-8b9c-0d1e2f3a4b5c> }
-    VALUES ?p { <http://data.lblod.info/vocabularies/erediensten/vestigingstype> <http://purl.org/dc/terms/description> <http://www.w3.org/ns/org#siteAddress> <https://data.vlaanderen.be/ns/organisatie#bestaatUit> }
-    GRAPH <http://mu.semte.ch/application> { ?s ?p ?o . }
-  }
-  UNION
-  {
-    VALUES ?s { <http://data.lblod.info/id/gestructureerdeIdentificatoren/2e4a6c8e-0b1d-4f3a-9c5e-7a9c1e3a5c7e> }
-    VALUES ?p { <https://data.vlaanderen.be/ns/generiek#lokaleIdentificator> }
+    VALUES ?p { <http://data.lblod.info/vocabularies/erediensten/vestigingstype> }
     GRAPH <http://mu.semte.ch/application> { ?s ?p ?o . }
   }
   UNION
   {
     VALUES ?s { <http://data.lblod.info/id/bestuurseenheden/9a01f3e2-4c7b-4d2a-9f1e-0a1b2c3d4e5f> }
-    VALUES ?p { <http://data.vlaanderen.be/ns/besluit#werkingsgebied> <http://www.w3.org/2004/02/skos/core#altLabel> <http://www.w3.org/2004/02/skos/core#prefLabel> <http://www.w3.org/ns/adms#identifier> <http://www.w3.org/ns/org#hasPrimarySite> <http://www.w3.org/ns/org#hasSite> <http://www.w3.org/ns/org#purpose> <http://www.w3.org/ns/regorg#legalName> <https://data.lblod.info/vocabularies/generiek/geplandeEindDatum> }
+    VALUES ?p { <http://data.vlaanderen.be/ns/besluit#werkingsgebied> <http://www.w3.org/2004/02/skos/core#prefLabel> }
     GRAPH <http://mu.semte.ch/application> { ?s ?p ?o . }
   }
   UNION
@@ -94,6 +116,8 @@ WHERE {
   {
     VALUES ?o { <http://data.lblod.info/id/contact-punten/c0ffee12-3456-4789-8abc-def012345678> }
     VALUES ?p { <http://schema.org/contactPoint> <http://www.w3.org/ns/org#siteAddress> }
+    FILTER NOT EXISTS { ?s a cr:ProposedVersion . }
+    FILTER NOT EXISTS { ?s a cr:RecordState . }
     GRAPH <http://mu.semte.ch/application> { ?s ?p ?o . }
   }
   UNION

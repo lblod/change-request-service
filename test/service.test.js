@@ -1,31 +1,90 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createService } from '../lib/change-requests.js';
-import { STATUS } from '../constants.js';
-import { model, config, resources, organisations, reachableByOrganisation, masterObjects, sessions, body, operations, IDS, URIS, NS, NOW, APPLIED_AT, uuidSequence, sequenceUuid } from './support/fixtures.js';
+import { createService, parseListQuery, pageLinks } from '../lib/change-requests.js';
+import { selectInBatches } from '../lib/sparql-result.js';
+import { STATUS, STEP_TYPE, OPERATION, SERVICE_AGENT } from '../constants.js';
+import {
+  model,
+  config,
+  resources,
+  organisations,
+  reachableByOrganisation,
+  masterState,
+  incomingMap,
+  sessions,
+  body,
+  operations,
+  IDS,
+  URIS,
+  NS,
+  NOW,
+  APPLIED_AT,
+  uri,
+  literal,
+  uuidSequence,
+  sequenceUuid,
+  testUuid,
+} from './support/fixtures.js';
 
 const bindings = (list) => ({
   results: {
     bindings: list.map((row) => Object.fromEntries(Object.entries(row).filter(([, value]) => value != null).map(([key, value]) => [key, typeof value === 'object' ? value : { value }]))),
   },
 });
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+/** The IRIs of a VALUES clause of a query, or null when it has none. */
+const valuesOf = (q, variable) => {
+  const match = q.match(new RegExp(`VALUES \\?${variable} \\{([^}]*)\\}`));
+  return match ? [...match[1].matchAll(/<([^>]+)>/g)].map((m) => m[1]) : null;
+};
+const pairsOf = (q) => [...q.matchAll(/\(<([^>]+)> <([^>]+)>\)/g)].map((m) => [m[1], m[2]]);
+
+const requestsMatching = (q, requests) => {
+  const uuid = q.match(/\?request mu:uuid """([^"]+)"""/)?.[1];
+  const target = q.match(/FILTER\(\?target = <([^>]+)>\)/)?.[1];
+  const visibleTo = q.match(/FILTER\(\?target = <([^>]+)> \|\| /)?.[1];
+  const uris = valuesOf(q, 'request');
+  const statuses = valuesOf(q, 'status');
+  return requests.filter(
+    (r) =>
+      (!uuid || r.uuid === uuid) &&
+      (!target || r.target === target) &&
+      (!visibleTo || r.target === visibleTo || r.requestingOrganisation === visibleTo) &&
+      (!uris || uris.includes(r.request)) &&
+      (!statuses || statuses.includes(r.status)),
+  );
+};
+const isApply = (q) => q.includes(`adms:status <${STATUS.goedgekeurd}> .\n    <`);
 
 /**
- * A stand-in for the triplestore that answers the service's lookups from the fixtures.
- * failApply: how many apply attempts fail before one succeeds.
+ * A stand-in for the triplestore: it answers the service's queries from an in-memory state (the
+ * organisations and records of the fixtures, master: the current values of the masters, which
+ * also tell what links to a record, records: uri -> { uuid, classes } of records that link to a
+ * deleted one, requests and steps: rows of stored requests and their steps, storedVersions: rows
+ * of their versions, replacedStates: rows of the states their steps replaced) and records the
+ * updates. Every call yields once, so concurrent calls interleave as they would against a real
+ * store. failApply: how many apply attempts fail before one succeeds. onUpdate(q, state) lets a
+ * test change the state the way an update would.
  */
-function fakeDb({ failApply = 0, requests = [], storedVersions = [], laterApplied = [] } = {}) {
+function fakeDb({ failApply = 0, requests = [], steps = [], storedVersions = [], replacedStates = [], laterApplied = [], master = masterState(), records = {}, uuids = {}, former = {}, onUpdate } = {}) {
+  const state = { requests, steps, storedVersions, replacedStates, laterApplied, master };
   const updates = [];
   const queries = [];
+  const log = [];
   let applyAttempts = 0;
   return {
+    state,
     updates,
     queries,
+    log,
     get applyAttempts() {
       return applyAttempts;
     },
     async query(q) {
+      await tick();
       queries.push(q);
+      log.push(['query', q]);
       if (q.includes('SELECT ?uri ?type ?classification')) {
         const uuid = q.match(/mu:uuid """([^"]+)"""/)[1];
         const organisation = organisations[uuid];
@@ -38,27 +97,93 @@ function fakeDb({ failApply = 0, requests = [], storedVersions = [], laterApplie
       }
       if (q.includes('SELECT DISTINCT ?resource')) {
         const targetUri = q.match(/\n {2}<([^>]+)> \(/)[1];
-        return bindings([...(reachableByOrganisation[targetUri] || [])].filter((uri) => uri !== targetUri).map((resource) => ({ resource })));
+        return bindings([...(reachableByOrganisation[targetUri] || [])].filter((resource) => resource !== targetUri).map((resource) => ({ resource })));
       }
       if (q.includes('SELECT ?s ?p ?o')) {
-        const pairs = [...q.matchAll(/\(<([^>]+)> <([^>]+)>\)/g)].map((m) => [m[1], m[2]]);
-        return bindings(pairs.flatMap(([s, p]) => (masterObjects[`${s} ${p}`] || []).map((o) => ({ s, p, o }))));
+        return { results: { bindings: pairsOf(q).flatMap(([s, p]) => (state.master[`${s} ${p}`] || []).map((o) => ({ s: uri(s), p: uri(p), o }))) } };
       }
-      if (q.includes('SELECT DISTINCT ?request')) {
-        const uuid = q.match(/\?request mu:uuid """([^"]+)"""/)?.[1];
-        const visibleTo = q.match(/FILTER\(\?target = <([^>]+)> \|\| /)?.[1];
-        return bindings(requests.filter((r) => (!uuid || r.uuid === uuid) && (!visibleTo || r.target === visibleTo || r.requestingOrganisation === visibleTo)));
+      if (q.includes('SELECT DISTINCT ?o ?p ?s')) {
+        const links = incomingMap(state.master);
+        return { results: { bindings: pairsOf(q).flatMap(([o, p]) => (links.get(`${o} ${p}`) || []).map((s) => ({ o: uri(o), p: uri(p), s }))) } };
       }
-      if (q.includes('SELECT ?version ?master')) return { results: { bindings: storedVersions } };
-      if (q.includes('SELECT ?request ?uuid ?created ?appliedAt')) return bindings(laterApplied);
+      if (q.includes('SELECT DISTINCT ?request ?created')) {
+        const page = requestsMatching(q, state.requests).sort((a, b) => b.created.localeCompare(a.created) || b.request.localeCompare(a.request));
+        const [limit, offset] = [Number(q.match(/LIMIT (\d+)/)[1]), Number(q.match(/OFFSET (\d+)/)[1])];
+        return bindings(page.slice(offset, offset + limit).map(({ request, created }) => ({ request, created })));
+      }
+      if (q.includes('SELECT (COUNT(DISTINCT ?request) AS ?count)')) return bindings([{ count: String(requestsMatching(q, state.requests).length) }]);
+      if (q.includes('SELECT DISTINCT ?request ?uuid ?created')) return bindings(requestsMatching(q, state.requests));
+      if (q.includes('SELECT DISTINCT ?request ?step ?stepUuid')) {
+        const visible = new Set(requestsMatching(q, state.requests).map((r) => r.request));
+        return bindings(state.steps.filter((step) => visible.has(step.request)));
+      }
+      if (q.includes('SELECT ?request ?version ?master')) {
+        const requested = valuesOf(q, 'request');
+        return { results: { bindings: state.storedVersions.filter((row) => requested.includes(row.request.value)) } };
+      }
+      if (q.includes('SELECT ?request ?step ?state ?master')) {
+        const requested = valuesOf(q, 'request');
+        return { results: { bindings: state.replacedStates.filter((row) => requested.includes(row.request.value)) } };
+      }
+      if (q.includes('SELECT DISTINCT ?request ?uuid ?appliedAt')) return bindings(state.laterApplied);
+      if (q.includes('SELECT DISTINCT ?request ?uuid\n')) {
+        // the pending requests whose stored versions replace one of the pairs
+        const pairs = pairsOf(q).map(([m, p]) => `${m} ${p}`);
+        const pending = new Map(state.requests.filter((r) => r.status === STATUS.ingediend).map((r) => [r.request, r.uuid]));
+        const found = new Set(
+          state.storedVersions
+            .filter((row) => !row.base && row.p.value === `${NS.cr}changesProperty` && pending.has(row.request.value) && pairs.includes(`${row.master.value} ${row.o.value}`))
+            .map((row) => row.request.value),
+        );
+        return bindings([...found].map((request) => ({ request, uuid: pending.get(request) })));
+      }
+      if (q.includes('SELECT DISTINCT ?uri ?uuid ?type')) {
+        const asked = valuesOf(q, 'uri');
+        return bindings(asked.filter((u) => records[u]).flatMap((u) => records[u].classes.map((type) => ({ uri: u, uuid: records[u].uuid, type }))));
+      }
+      if (q.includes('SELECT DISTINCT ?uri ?uuid')) {
+        const asked = valuesOf(q, 'uri');
+        return bindings(asked.filter((u) => uuids[u]).map((u) => ({ uri: u, uuid: uuids[u] })));
+      }
+      if (q.includes('SELECT DISTINCT ?uuid ?uri')) {
+        const asked = [...q.matchAll(/"""([^"]+)"""/g)].map((m) => m[1]);
+        return bindings(asked.filter((id) => former[id]).map((id) => ({ uuid: id, uri: former[id] })));
+      }
       throw new Error(`unexpected query: ${q}`);
     },
     async update(q) {
+      await tick();
       updates.push(q);
-      if (q.includes('cr:appliedAt "') && applyAttempts++ < failApply) throw new Error('Virtuoso said no');
+      log.push(['update', q]);
+      if (isApply(q) && applyAttempts++ < failApply) throw new Error('Virtuoso said no');
+      onUpdate?.(q, state);
     },
   };
 }
+
+/** onUpdate: keeps requests and steps in step with the step updates, as the triplestore would. */
+const recordSteps = (q, state) => {
+  const written = q.match(/<([^>]+)> adms:status <([^>]+)>(?: ;\n {6}dct:isReplacedBy <([^>]+)>)? \.\n {4}<([^>]+)> a cr:Action ;/);
+  if (!written) return;
+  const [, requestUri, status, replacedBy, stepUri] = written;
+  const field = (pattern) => q.match(pattern)?.[1];
+  const request = state.requests.find((r) => r.request === requestUri);
+  if (request) {
+    request.status = status;
+    if (replacedBy) Object.assign(request, { replacedBy, replacedByUuid: replacedBy.split('/').pop() });
+  }
+  state.steps = state.steps.filter((step) => step.step !== stepUri);
+  state.steps.push({
+    request: requestUri,
+    step: stepUri,
+    stepUuid: stepUri.split('/').pop(),
+    sequence: field(/schema:position "(\d+)"/),
+    type: field(/dct:type <([^>]+)>/),
+    status,
+    at: field(/prov:startedAtTime "([^"]+)"/),
+    agent: field(/prov:wasAssociatedWith <([^>]+)>/),
+  });
+};
 
 const clock = () => {
   const times = [NOW, APPLIED_AT];
@@ -68,7 +193,21 @@ const clock = () => {
 
 const service = (db) => createService({ model, config, db, mintUuid: uuidSequence(), clock: clock() });
 
-test('an organisation edits itself: the request is written, applied and answered with 201', async () => {
+const prefLabel = `${NS.skos}prefLabel`;
+const withName = (name, state = masterState()) => ({ ...state, [`${URIS.org} ${prefLabel}`]: [literal(name)] });
+const rename = (name, base) => body(IDS.org, 'organization-core-data', [
+  { op: 'update', data: { type: 'administrative-units', id: IDS.org, attributes: { name }, ...(base !== undefined ? { meta: { base: { attributes: { name: base } } } } : {}) } },
+]);
+/** The conflict of a form that loaded the name "Aalst" and proposes "Aalst (A)" after ABB renamed the organisation. */
+const nameConflict = { resource: { type: 'administrative-units', id: IDS.org }, key: 'name', base: 'Aalst', current: 'Aalst (ABB)', proposed: 'Aalst (A)', 'master-exists': true, 'competing-requests': [] };
+const userStep = (session, fields) => ({
+  at: '2026-11-03T10:12:00.000Z', agent: 'user', person: session.personUuid, organisation: session.actor.uuid, rule: null, reason: null, error: null, 'overrides-conflict': false, 'overridden-conflicts': [], ...fields,
+});
+const serviceApproval = { sequence: 2, type: 'goedkeuring', status: 'goedgekeurd', at: '2026-11-03T10:12:01.000Z', agent: 'service', person: null, organisation: null, rule: 'always', reason: null, error: null, 'overrides-conflict': false, 'overridden-conflicts': [] };
+
+// --- POST /change-requests ------------------------------------------------------------------
+
+test('an organisation edits itself: the request with its indiening step and versions is written, the service approves and applies it', async () => {
   const db = fakeDb();
   const { status, document } = await service(db).create(sessions.orgA, body());
   assert.equal(status, 201);
@@ -79,19 +218,34 @@ test('an organisation edits itself: the request is written, applied and answered
     created: '2026-11-03T10:12:00.000Z',
     'applied-at': '2026-11-03T10:12:01.000Z',
     aggregate: 'organization-core-data',
+    error: null,
+    steps: [userStep(sessions.orgA, { sequence: 1, type: 'indiening', status: 'ingediend', rule: 'own-organisation' }), serviceApproval],
+    conflicts: [],
+    'conflicts-token': null,
+    competing: [],
+    'replaced-by': null,
     lids: { c1: sequenceUuid(2) },
+    superseded: [],
   });
+  assert.equal(document.attributes.status, document.attributes.steps.at(-1).status, 'the status is the status of the last step');
   assert.deepEqual(document.relationships, {
     target: { data: { type: 'organizations', id: IDS.org } },
     'requesting-organisation': { data: { type: 'organizations', id: IDS.org } },
   });
   assert.equal(db.updates.length, 2, 'the request insert and the apply');
-  assert.ok(db.updates[0].includes('a cr:ChangeRequest') && db.updates[0].includes(`<${STATUS.ingediend}>`));
-  assert.ok(db.updates[1].includes('cr:appliedAt') && db.updates[1].includes(`<${STATUS.goedgekeurd}>`));
-  assert.ok(db.updates[1].includes(`ext:lastModifiedBy <${URIS.account}>`));
-  // the lookups: target, the referenced ids and the reachable records in one round, the unchanged check
+  const [insert, apply] = db.updates;
+  assert.ok(insert.includes('a cr:ChangeRequest') && insert.includes(`adms:status <${STATUS.ingediend}>`));
+  assert.ok(insert.includes(`pav:createdBy <${URIS.org}> ;\n      dct:creator <${URIS.person}> .`), 'the organisation and the person, not the account');
+  assert.ok(insert.includes(`dct:type <${STEP_TYPE.indiening}> ;\n      adms:status <${STATUS.ingediend}> ;\n      schema:position "1"^^xsd:integer ;`));
+  assert.ok(insert.includes(`prov:wasAssociatedWith <${URIS.person}> ;\n      cr:actingOrganisation <${URIS.org}> ;\n      cr:rule """own-organisation"""`));
+  assert.ok(apply.includes(`dct:type <${STEP_TYPE.goedkeuring}> ;\n      adms:status <${STATUS.goedgekeurd}> ;\n      schema:position "2"^^xsd:integer ;`));
+  assert.ok(apply.includes(`prov:wasAssociatedWith <${SERVICE_AGENT}> ;\n      cr:rule """always""" ;\n      prov:invalidated <http://data.lblod.info/id/record-states/`), 'with the states it replaced');
+  assert.ok(apply.includes(`a cr:RecordState ;`) && apply.includes(`<${prefLabel}> """Aalst"""`), 'the name the organisation had');
+  assert.ok(apply.includes(`ext:lastModifiedBy <${URIS.person}>`));
+  // the lookups: the reachable records, the current values of every carried key and the unchanged checks in one query
   assert.ok(db.queries.some((q) => q.includes('SELECT DISTINCT ?resource') && q.includes(`<${URIS.org}> (`)));
-  assert.ok(db.queries.some((q) => q.includes('SELECT ?s ?p ?o') && q.includes(`(<${URIS.org}> <${NS.org}classification>)`)));
+  const current = db.queries.find((q) => q.includes('SELECT ?s ?p ?o'));
+  assert.ok(current.includes(`(<${URIS.org}> <${NS.org}classification>)`) && current.includes(`(<${URIS.org}> <${prefLabel}>)`));
 });
 
 test('a failed apply is retried once; when the retry succeeds the request is goedgekeurd', async () => {
@@ -104,16 +258,20 @@ test('a failed apply is retried once; when the retry succeeds the request is goe
   assert.equal(db.updates[1], db.updates[2], 'the same idempotent update');
 });
 
-test('when the retry fails too the request is marked mislukt with the error and the answer is 409', async () => {
+test('when the retry fails too the goedkeuring step is recorded as mislukt with the error, and the answer is 409', async () => {
   const db = fakeDb({ failApply: 2 });
   await assert.rejects(() => service(db).create(sessions.orgA, body()), (error) => {
     assert.equal(error.status, 409);
-    assert.match(error.detail, /^Virtuoso said no\. The request is kept with status mislukt; POST \/change-requests\/.*\/apply applies its stored versions again/);
+    assert.match(error.detail, /^Virtuoso said no\. The request is kept with status mislukt; a hertoepassing \(POST \/change-requests\/.*\/steps\) applies its stored versions again/);
     assert.deepEqual(error.meta, { 'change-request': { id: sequenceUuid(1), status: 'mislukt' } });
     return true;
   });
   assert.equal(db.updates.length, 4);
-  assert.ok(db.updates[3].includes(`<${STATUS.mislukt}>`) && db.updates[3].includes('cr:error """Virtuoso said no"""'));
+  const failure = db.updates[3];
+  assert.ok(failure.includes(`adms:status <${STATUS.mislukt}> .\n    <http://data.lblod.info/id/change-request-actions/`));
+  assert.ok(failure.includes(`dct:type <${STEP_TYPE.goedkeuring}> ;\n      adms:status <${STATUS.mislukt}> ;\n      schema:position "2"^^xsd:integer ;`));
+  assert.ok(failure.includes(`task:error <http://redpencil.data.gift/id/jobs/error/`));
+  assert.ok(failure.includes(`a oslc:Error ;`) && failure.includes('oslc:message """Virtuoso said no"""') && failure.includes(`dct:creator <${SERVICE_AGENT}>`));
 });
 
 test('another organisation is refused with 403 and the policy outcome; nothing is written', async () => {
@@ -123,7 +281,6 @@ test('another organisation is refused with 403 and the policy outcome; nothing i
 });
 
 test('ids of another organisation are refused with 422 even when the target is the acting organisation', async () => {
-  const siteB = resources.get(IDS.siteB);
   const refused = async (ops, detail) => {
     const db = fakeDb();
     await assert.rejects(() => service(db).create(sessions.orgA, body(IDS.org, 'organization-core-data', ops)), { status: 422, detail });
@@ -135,7 +292,6 @@ test('ids of another organisation are refused with 422 even when the target is t
   await refused([{ op: 'update', data: { type: 'administrative-units', id: IDS.org, relationships: { 'primary-site': { data: { type: 'sites', id: IDS.siteB } } } } }], /does not belong to the target organisation/);
   await refused([{ op: 'delete', data: { type: 'administrative-units', id: IDS.org } }], /cannot be deleted/);
   await refused([{ op: 'create', data: { type: 'administrative-units', lid: 'o1', attributes: { name: 'Gemeente Nergens' } } }], /cannot be created/);
-  assert.equal(siteB.uri, URIS.siteB);
 });
 
 test('a relationship outside the aggregate passes when unchanged and is refused with 422 when it differs', async () => {
@@ -164,6 +320,7 @@ test('ABB edits another organisation', async () => {
   assert.equal(status, 201);
   assert.equal(document.attributes.status, 'goedgekeurd');
   assert.equal(document.relationships['requesting-organisation'].data.id, IDS.abb);
+  assert.deepEqual(document.attributes.steps[0], userStep(sessions.abb, { sequence: 1, type: 'indiening', status: 'ingediend', rule: 'abb-edits-all' }));
   assert.ok(db.updates[1].includes(`<${URIS.orgB}> dct:modified`));
 });
 
@@ -187,120 +344,783 @@ test('permissions answer with the deciding rule, the same evaluation as the POST
   await assert.rejects(() => service(fakeDb()).permissions(sessions.orgA, 'ffffffff-ffff-4fff-8fff-ffffffffffff'), { status: 404 });
 });
 
-const storedRequest = {
-  request: 'http://data.lblod.info/id/change-requests/r1',
-  uuid: 'r1',
+// --- base values and conflicts at submission --------------------------------------------------
+
+test('a stale form: a key someone changed since is a conflict; the request stays ingediend with the conflict listed and nothing is applied', async () => {
+  const db = fakeDb({ master: withName('Aalst (ABB)') });
+  const { status, document } = await service(db).create(sessions.orgA, rename('Aalst (A)', 'Aalst'));
+  assert.equal(status, 201);
+  assert.equal(document.attributes.status, 'ingediend');
+  assert.equal(document.attributes['applied-at'], null);
+  assert.deepEqual(document.attributes.steps, [userStep(sessions.orgA, { sequence: 1, type: 'indiening', status: 'ingediend', rule: 'own-organisation' })]);
+  assert.deepEqual(document.attributes.conflicts, [nameConflict]);
+  assert.match(document.attributes['conflicts-token'], /^[0-9a-f]{64}$/);
+  assert.equal(db.updates.length, 1, 'the insert only: hold-on-conflict keeps it from the apply');
+  assert.ok(db.updates[0].includes(`<${prefLabel}> """Aalst (A)"""`), 'the proposal is kept in the version');
+  assert.ok(db.updates[0].includes(`a cr:RecordState ;\n      mu:uuid`) && db.updates[0].includes(`<${prefLabel}> """Aalst""" .`), 'with the base it started from');
+});
+
+test('the same stale form changing only another attribute applies that one and leaves the newer name alone', async () => {
+  const db = fakeDb({ master: withName('Aalst (ABB)') });
+  const ops = [
+    { op: 'update', data: { type: 'administrative-units', id: IDS.org, attributes: { name: 'Aalst', 'legal-name': 'Stad Aalst' }, meta: { base: { attributes: { name: 'Aalst', 'legal-name': null } } } } },
+  ];
+  const { document } = await service(db).create(sessions.orgA, body(IDS.org, 'organization-core-data', ops));
+  assert.equal(document.attributes.status, 'goedgekeurd');
+  assert.deepEqual(document.attributes.conflicts, []);
+  const apply = db.updates[1];
+  assert.ok(apply.includes(`<${URIS.org}> <${NS.regorg}legalName> """Stad Aalst""" .`));
+  assert.ok(!apply.includes(prefLabel), 'the name is neither deleted nor written');
+});
+
+test('a request whose operations change nothing is recorded and approved like any other, with zero versions', async () => {
+  const db = fakeDb();
+  const { status, document } = await service(db).create(sessions.orgA, rename('Aalst'));
+  assert.equal(status, 201);
+  assert.equal(document.attributes.status, 'goedgekeurd');
+  assert.equal(document.attributes.steps.length, 2);
+  const [insert, apply] = db.updates;
+  assert.ok(!insert.includes('cr:ProposedVersion') && !insert.includes('prov:generated'), 'no versions');
+  assert.ok(!apply.includes('http://mu.semte.ch/application'), 'nothing to apply, no dct:modified stamp');
+  assert.ok(apply.includes(`dct:type <${STEP_TYPE.goedkeuring}>`));
+});
+
+test('competing requests: other pending requests that write the same key with another value are listed, on the conflict and as competing', async () => {
+  const db = fakeDb({
+    master: withName('Aalst (ABB)'),
+    requests: [requestRow(7, 'ingediend'), requestRow(8, 'ingediend')],
+    storedVersions: [...storedRename(7, 'Aalst (B)'), ...storedRename(8, 'Aalst (A)')],
+  });
+  const { document } = await service(db).create(sessions.orgA, rename('Aalst (A)', 'Aalst'));
+  assert.deepEqual(document.attributes.conflicts[0]['competing-requests'], [RID(7)], 'the other one proposes the same name: it agrees');
+  assert.deepEqual(document.attributes.competing, [{ resource: { type: 'administrative-units', id: IDS.org }, key: 'name', proposed: 'Aalst (A)', 'competing-requests': [RID(7)] }]);
+  assert.ok(db.queries.some((q) => q.includes(`VALUES (?master ?p) { (<${URIS.org}> <${prefLabel}>) }`)));
+});
+
+test('a relationship conflict shows the records as identifiers, the current one looked up by uri', async () => {
+  const other = 'http://data.lblod.info/id/vestigingen/e5e5e5e5-0000-4000-8000-000000000001';
+  const db = fakeDb({ master: { ...masterState(), [`${URIS.org} ${NS.org}hasPrimarySite`]: [uri(other)] }, uuids: { [other]: 'e5e5e5e5-0000-4000-8000-000000000001' } });
+  const ops = [
+    { op: 'update', data: { type: 'administrative-units', id: IDS.org, relationships: { 'primary-site': { data: { type: 'sites', id: IDS.site } } }, meta: { base: { relationships: { 'primary-site': { data: null } } } } } },
+  ];
+  const { document } = await service(db).create(sessions.orgA, body(IDS.org, 'organization-core-data', ops));
+  assert.equal(document.attributes.status, 'ingediend');
+  assert.deepEqual(document.attributes.conflicts, [
+    {
+      resource: { type: 'administrative-units', id: IDS.org },
+      key: 'primary-site',
+      base: null,
+      current: { type: 'sites', id: 'e5e5e5e5-0000-4000-8000-000000000001' },
+      proposed: { type: 'sites', id: IDS.site },
+      'master-exists': true,
+      'competing-requests': [],
+    },
+  ]);
+});
+
+test('a base may refer to a record deleted since: it is found through its versions', async () => {
+  const gone = 'd0d0d0d0-0000-4000-8000-000000000001';
+  const goneUri = `http://data.lblod.info/id/contact-punten/${gone}`;
+  const db = fakeDb({ former: { [gone]: goneUri } });
+  // the page loaded the old contact and one that was deleted meanwhile, and removes the latter
+  const ops = [
+    {
+      op: 'update',
+      data: {
+        type: 'sites',
+        id: IDS.site,
+        relationships: { contacts: { data: [{ type: 'contact-points', id: IDS.oldContact }] } },
+        meta: { base: { relationships: { contacts: { data: [{ type: 'contact-points', id: IDS.oldContact }, { type: 'contact-points', id: gone }] } } } },
+      },
+    },
+  ];
+  const { document } = await service(db).create(sessions.orgA, body(IDS.org, 'organization-core-data', ops));
+  assert.equal(document.attributes.status, 'goedgekeurd');
+  assert.ok(db.queries.some((q) => q.includes('SELECT DISTINCT ?uuid ?uri') && q.includes(gone)));
+  assert.ok(!db.updates[0].includes('cr:ProposedVersion'), 'the master already holds the proposal: agreement, nothing to write');
+});
+
+// --- reading requests -------------------------------------------------------------------------
+
+const RID = (n) => testUuid('request', n);
+const SID = (n, sequence) => testUuid('step', n * 10 + sequence);
+const REQUEST = (n) => `http://data.lblod.info/id/change-requests/${RID(n)}`;
+const requestRow = (n, status, extra = {}) => ({
+  request: REQUEST(n),
+  uuid: RID(n),
   created: '2026-11-03T10:12:00Z',
-  status: STATUS.goedgekeurd,
+  status: STATUS[status],
   aggregate: 'organization-core-data',
   target: URIS.org,
   targetUuid: IDS.org,
-  requestingOrganisation: URIS.abb,
-  requestingOrganisationUuid: IDS.abb,
-  account: URIS.accountAbb,
-  appliedAt: '2026-11-03T10:12:01Z',
+  requestingOrganisation: URIS.org,
+  requestingOrganisationUuid: IDS.org,
+  creator: URIS.person,
+  ...extra,
+});
+const STEP = (n, sequence) => `http://data.lblod.info/id/change-request-actions/${SID(n, sequence)}`;
+const stepRow = (n, sequence, type, status, extra = {}) => ({
+  request: REQUEST(n),
+  step: STEP(n, sequence),
+  stepUuid: SID(n, sequence),
+  sequence: String(sequence),
+  type: STEP_TYPE[type],
+  status: STATUS[status],
+  at: `2026-11-03T10:1${sequence}:00Z`,
+  agent: URIS.person,
+  agentUuid: sessions.orgA.personUuid,
+  organisation: URIS.org,
+  organisationUuid: IDS.org,
+  rule: 'own-organisation',
+  ...extra,
+});
+const serviceStep = { agent: SERVICE_AGENT, agentUuid: null, organisation: null, organisationUuid: null, rule: 'always' };
+/**
+ * The stored rows of a version of request n (number: the version's own number, n by default):
+ * operation update or delete; keys [{ predicate, proposed: [bindings], base: [bindings] }] go to
+ * the version and its base state, links [{ predicate, subject }] to the links its base state
+ * remembers (a tombstone's).
+ */
+const storedVersion = (n, { operation = 'update', master = URIS.org, masterUuid = IDS.org, type = 'administrative-units', keys = [], links = [], number = n }) => {
+  const version = `http://data.lblod.info/id/proposed-versions/${testUuid('version', number)}`;
+  const baseUri = `http://data.lblod.info/id/record-states/${testUuid('state', number)}`;
+  const linkUri = (index) => `http://data.lblod.info/id/record-links/${testUuid('link', 100 * number + index)}`;
+  const row = (p, o, record = {}) => ({ request: uri(REQUEST(n)), version: uri(version), master: uri(master), masterUuid: literal(masterUuid), type: literal(type), operation: uri(OPERATION[operation]), p: uri(p), o, ...record });
+  const base = { base: uri(baseUri) };
+  return [
+    row(`${NS.rdf}type`, uri(`${NS.cr}ProposedVersion`)),
+    row(`${NS.mu}uuid`, literal(testUuid('version', number))),
+    row(`${NS.cr}base`, uri(baseUri)),
+    ...keys.map(({ predicate }) => row(`${NS.cr}changesProperty`, uri(predicate))),
+    ...keys.flatMap(({ predicate, proposed = [] }) => proposed.map((o) => row(predicate, o))),
+    row(`${NS.rdf}type`, uri(`${NS.cr}RecordState`), base),
+    row(`${NS.mu}uuid`, literal(testUuid('state', number)), base),
+    row(`${NS.dct}isVersionOf`, uri(master), base),
+    ...keys.flatMap(({ predicate, base: values = [] }) => values.map((o) => row(predicate, o, base))),
+    ...links.flatMap(({ predicate, subject }, index) => [
+      row(`${NS.cr}incomingLink`, uri(linkUri(index)), base),
+      row(`${NS.rdf}type`, uri(`${NS.rdf}Statement`), { ...base, link: uri(linkUri(index)) }),
+      row(`${NS.rdf}subject`, uri(subject), { ...base, link: uri(linkUri(index)) }),
+      row(`${NS.rdf}predicate`, uri(predicate), { ...base, link: uri(linkUri(index)) }),
+      row(`${NS.rdf}object`, uri(master), { ...base, link: uri(linkUri(index)) }),
+    ]),
+  ];
 };
+/** The rows of a state step (sequence) of request n replaced: values [[predicate, binding]] of master. */
+const replacedState = (n, sequence, { master = URIS.org, values = [], number = n }) => {
+  const state = `http://data.lblod.info/id/record-states/${testUuid('state', 500 + number)}`;
+  const row = (p, o) => ({ request: uri(REQUEST(n)), step: uri(STEP(n, sequence)), state: uri(state), master: uri(master), p: uri(p), o });
+  return [row(`${NS.rdf}type`, uri(`${NS.cr}RecordState`)), row(`${NS.dct}isVersionOf`, uri(master)), ...values.map(([p, o]) => row(p, o))];
+};
+/** The stored rename of request n: base "Aalst", proposal "Aalst (A)". */
+const storedRename = (n, proposed = 'Aalst (A)', base = 'Aalst') => storedVersion(n, { keys: [{ predicate: prefLabel, proposed: [literal(proposed)], base: [literal(base)] }] });
+
+// A request ABB submitted about organisation A, approved at once.
+const abbRequest = requestRow(1, 'goedgekeurd', { requestingOrganisation: URIS.abb, requestingOrganisationUuid: IDS.abb, creator: URIS.personAbb });
+
+test('a listed request shows its status, steps and organisations', async () => {
+  const steps = [
+    stepRow(1, 1, 'indiening', 'ingediend', { agent: URIS.personAbb, agentUuid: sessions.abb.personUuid, organisation: URIS.abb, organisationUuid: IDS.abb, rule: 'abb-edits-all' }),
+    stepRow(1, 2, 'goedkeuring', 'goedgekeurd', serviceStep),
+  ];
+  const db = fakeDb({ requests: [abbRequest], steps });
+  const { documents: list, count } = await service(db).list(sessions.orgA, { target: IDS.org });
+  assert.equal(list.length, 1);
+  assert.equal(count, 1);
+  assert.deepEqual(list[0].attributes, {
+    status: 'goedgekeurd',
+    created: '2026-11-03T10:12:00.000Z',
+    'applied-at': '2026-11-03T10:12:00.000Z',
+    aggregate: 'organization-core-data',
+    error: null,
+    steps: [
+      userStep(sessions.abb, { sequence: 1, type: 'indiening', status: 'ingediend', at: '2026-11-03T10:11:00.000Z', rule: 'abb-edits-all' }),
+      { ...serviceApproval, at: '2026-11-03T10:12:00.000Z' },
+    ],
+    conflicts: [],
+    'conflicts-token': null,
+    competing: [],
+    'replaced-by': null,
+  });
+  assert.deepEqual(list[0].relationships['requesting-organisation'].data, { type: 'organizations', id: IDS.abb });
+  const failed = await service(fakeDb({ requests: [requestRow(2, 'mislukt')], steps: [stepRow(2, 1, 'indiening', 'ingediend'), stepRow(2, 2, 'goedkeuring', 'mislukt', { ...serviceStep, error: 'Virtuoso said no' })] })).get(sessions.orgA, RID(2));
+  assert.equal(failed.attributes.error, 'Virtuoso said no', 'the message of the oslc:Error of its last step');
+  assert.equal(failed.attributes.status, 'mislukt');
+});
 
 test('listing is filtered to what the acting organisation may see; ABB sees all', async () => {
-  const db = fakeDb({ requests: [storedRequest] });
-  const list = await service(db).list(sessions.orgA, IDS.org);
-  assert.equal(list.length, 1);
-  assert.deepEqual(list[0].attributes, { status: 'goedgekeurd', created: '2026-11-03T10:12:00.000Z', 'applied-at': '2026-11-03T10:12:01.000Z', aggregate: 'organization-core-data' });
-  assert.deepEqual(list[0].relationships['requesting-organisation'].data, { type: 'organizations', id: IDS.abb });
-  const listQuery = db.queries.at(-1);
-  assert.ok(listQuery.includes(`FILTER(?target = <${URIS.org}>)`));
-  assert.ok(listQuery.includes(`FILTER(?target = <${URIS.org}> || ?requestingOrganisation = <${URIS.org}>)`));
+  const db = fakeDb({ requests: [abbRequest] });
+  await service(db).list(sessions.orgA, { target: IDS.org });
+  const pageQuery = db.queries.find((q) => q.includes('SELECT DISTINCT ?request ?created'));
+  const countQuery = db.queries.find((q) => q.includes('SELECT (COUNT(DISTINCT ?request) AS ?count)'));
+  for (const q of [pageQuery, countQuery]) {
+    assert.ok(q.includes(`FILTER(?target = <${URIS.org}>)`));
+    assert.ok(q.includes(`FILTER(?target = <${URIS.org}> || ?requestingOrganisation = <${URIS.org}>)`));
+  }
+  const all = fakeDb({ requests: [abbRequest] });
+  await service(all).list(sessions.abb);
+  assert.ok(all.queries.filter((q) => q.includes('?request a cr:ChangeRequest')).every((q) => !q.includes('FILTER')), 'ABB sees all, unfiltered');
+  assert.deepEqual(await service(db).list(sessions.orgA, { target: 'ffffffff-ffff-4fff-8fff-ffffffffffff' }), { documents: [], count: 0 }, 'a filter on an unknown organisation is an empty list');
+});
 
-  await service(db).list(sessions.abb);
-  assert.ok(!db.queries.at(-1).includes('FILTER'), 'ABB sees all, unfiltered');
+test('listing is paged, newest first: the steps, versions and current values are read for the requests of the page only', async () => {
+  const at = (minute) => `2026-11-03T10:${String(minute).padStart(2, '0')}:00Z`;
+  const requests = [1, 2, 3, 4, 5].map((n) => requestRow(n, n === 4 ? 'ingediend' : 'goedgekeurd', { created: at(n) }));
+  const db = fakeDb({ requests, steps: [stepRow(4, 1, 'indiening', 'ingediend'), stepRow(5, 1, 'indiening', 'ingediend'), stepRow(5, 2, 'goedkeuring', 'goedgekeurd', serviceStep)], storedVersions: [...storedRename(4), ...storedRename(5)] });
+  const first = await service(db).list(sessions.abb, { statuses: [], page: { number: 0, size: 2 } });
+  assert.deepEqual(first.documents.map((document) => document.id), [RID(5), RID(4)]);
+  assert.equal(first.count, 5);
+  assert.ok(db.queries.find((q) => q.includes('SELECT DISTINCT ?request ?created')).includes('ORDER BY DESC(?created) DESC(?request)\nLIMIT 2\nOFFSET 0'));
+  for (const q of db.queries.filter((query) => query.includes('SELECT DISTINCT ?request ?uuid ?created') || query.includes('SELECT DISTINCT ?request ?step ?stepUuid'))) {
+    assert.ok(q.includes(`VALUES ?request { <${REQUEST(5)}> <${REQUEST(4)}> }`), 'the details of the page');
+  }
+  const versionQueries = db.queries.filter((q) => q.includes('SELECT ?request ?version ?master')).map((q) => valuesOf(q, 'request'));
+  assert.deepEqual(versionQueries.map((uris) => uris.join(' ')).sort(), [REQUEST(4), REQUEST(5)].sort(), 'the versions of its pending request (live conflicts) and of its applied one (what it overrode)');
+  assert.ok(db.queries.some((q) => q.includes('SELECT ?request ?step ?state ?master') && valuesOf(q, 'request').join(' ') === REQUEST(5)), 'the states the goedkeuring replaced');
+  const last = await service(db).list(sessions.abb, { statuses: [], page: { number: 2, size: 2 } });
+  assert.deepEqual(last.documents.map((document) => document.id), [RID(1)]);
+  const pending = await service(db).list(sessions.abb, { statuses: ['ingediend'], page: { number: 0, size: 20 } });
+  assert.deepEqual([pending.documents.map((document) => document.id), pending.count], [[RID(4)], 1]);
+  assert.ok(db.queries.at(-1).includes(`VALUES ?status { <${STATUS.ingediend}> }`) || db.queries.some((q) => q.includes(`VALUES ?status { <${STATUS.ingediend}> }`)));
+});
 
-  assert.deepEqual(await service(db).list(sessions.orgA, 'ffffffff-ffff-4fff-8fff-ffffffffffff'), [], 'a filter on an unknown organisation is an empty list');
+test('the list query: filter[target], filter[status], page[number] and page[size], with JSON:API links', () => {
+  assert.deepEqual(parseListQuery({}), { target: undefined, statuses: [], page: { number: 0, size: 20 } });
+  const query = parseListQuery({ filter: { target: IDS.org, status: 'ingediend,mislukt' }, page: { number: '1', size: '10' } });
+  assert.deepEqual(query, { target: IDS.org, statuses: ['ingediend', 'mislukt'], page: { number: 1, size: 10 } });
+  for (const bad of [{ filter: { status: 'pending' } }, { filter: { status: ['ingediend'] } }, { page: { size: '0' } }, { page: { size: '101' } }, { page: { number: '-1' } }, { page: { number: 'x' } }]) {
+    assert.throws(() => parseListQuery(bad), { status: 400 }, JSON.stringify(bad));
+  }
+  assert.deepEqual(pageLinks(query, 35), {
+    first: `/change-requests?filter%5Btarget%5D=${IDS.org}&filter%5Bstatus%5D=ingediend%2Cmislukt&page%5Bnumber%5D=0&page%5Bsize%5D=10`,
+    last: `/change-requests?filter%5Btarget%5D=${IDS.org}&filter%5Bstatus%5D=ingediend%2Cmislukt&page%5Bnumber%5D=3&page%5Bsize%5D=10`,
+    prev: `/change-requests?filter%5Btarget%5D=${IDS.org}&filter%5Bstatus%5D=ingediend%2Cmislukt&page%5Bnumber%5D=0&page%5Bsize%5D=10`,
+    next: `/change-requests?filter%5Btarget%5D=${IDS.org}&filter%5Bstatus%5D=ingediend%2Cmislukt&page%5Bnumber%5D=2&page%5Bsize%5D=10`,
+  });
+  assert.deepEqual(Object.keys(pageLinks(parseListQuery({}), 0)), ['first', 'last'], 'one empty page');
 });
 
 test('a single request is a 404 when it is not visible', async () => {
-  const found = await service(fakeDb({ requests: [storedRequest] })).get(sessions.orgA, 'r1');
-  assert.equal(found.id, 'r1');
-  await assert.rejects(() => service(fakeDb({ requests: [storedRequest] })).get(sessions.orgB, 'r1'), { status: 404 });
+  const found = await service(fakeDb({ requests: [abbRequest] })).get(sessions.orgA, RID(1));
+  assert.equal(found.id, RID(1));
+  await assert.rejects(() => service(fakeDb({ requests: [abbRequest] })).get(sessions.orgB, RID(1)), { status: 404 });
 });
 
-// A failed request of organisation A with its stored versions: an update of the address and a
-// create of a contact point.
-const failedRequest = {
-  ...storedRequest,
-  request: 'http://data.lblod.info/id/change-requests/r2',
-  uuid: 'r2',
-  status: STATUS.mislukt,
-  requestingOrganisation: URIS.org,
-  requestingOrganisationUuid: IDS.org,
-  account: URIS.account,
-  appliedAt: null,
-  error: 'Virtuoso said no',
-};
-const uri = (value) => ({ type: 'uri', value });
-const literal = (value) => ({ type: 'literal', value });
-const storedVersion = (version, triples) =>
-  triples.map(([p, o]) => ({ version: uri(version.uri), master: uri(version.master), masterUuid: literal(version.masterUuid), type: literal(version.type), operation: literal(version.operation), p: uri(p), o }));
-const storedVersions = [
-  ...storedVersion({ uri: 'http://data.lblod.info/id/versions/v1', master: URIS.address, masterUuid: IDS.address, type: 'addresses', operation: 'update' }, [
-    [`${NS.rdf}type`, uri(`${NS.cr}Version`)],
-    [`${NS.mu}uuid`, literal('v1')],
-    [`${NS.cr}replaces`, uri(`${NS.locn}thoroughfare`)],
-    [`${NS.cr}replaces`, uri(`${NS.adres}Adresvoorstelling.huisnummer`)],
-    [`${NS.locn}thoroughfare`, literal('Nieuwe straat')],
-  ]),
-  ...storedVersion({ uri: 'http://data.lblod.info/id/versions/v2', master: 'http://data.lblod.info/id/contact-punten/new1', masterUuid: 'new1', type: 'contact-points', operation: 'create' }, [
-    [`${NS.rdf}type`, uri(`${NS.cr}Version`)],
-    [`${NS.mu}uuid`, literal('v2')],
-    [`${NS.cr}replaces`, uri(`${NS.schema}email`)],
-    [`${NS.schema}email`, literal('info@aalst.be')],
-  ]),
-];
+test('a request shows its steps in sequence order, with person, organisation, rule, reason and error', async () => {
+  const steps = [
+    stepRow(3, 3, 'hertoepassing', 'goedgekeurd', { at: '2026-11-03T11:00:00Z' }),
+    stepRow(3, 1, 'indiening', 'ingediend'),
+    stepRow(3, 2, 'goedkeuring', 'mislukt', { ...serviceStep, error: 'Virtuoso said no' }),
+  ];
+  const document = await service(fakeDb({ requests: [requestRow(3, 'goedgekeurd')], steps })).get(sessions.orgA, RID(3));
+  assert.deepEqual(document.attributes.steps.map((step) => [step.sequence, step.type, step.status, step.agent, step.error]), [
+    [1, 'indiening', 'ingediend', 'user', null],
+    [2, 'goedkeuring', 'mislukt', 'service', 'Virtuoso said no'],
+    [3, 'hertoepassing', 'goedgekeurd', 'user', null],
+  ]);
+  assert.equal(document.attributes['applied-at'], '2026-11-03T11:00:00.000Z', 'the start of the last goedgekeurd step');
+  assert.equal(document.attributes.error, null, 'the error of the last step');
+  const rejected = await service(fakeDb({
+    requests: [requestRow(4, 'afgekeurd')],
+    steps: [stepRow(4, 1, 'indiening', 'ingediend'), stepRow(4, 2, 'afkeuring', 'afgekeurd', { agent: URIS.personAbb, agentUuid: sessions.abb.personUuid, organisation: URIS.abb, organisationUuid: IDS.abb, rule: 'abb-decides-all', reason: 'Fout KBO-nummer' })],
+  })).get(sessions.orgA, RID(4));
+  assert.deepEqual(rejected.attributes.steps[1], {
+    sequence: 2, type: 'afkeuring', status: 'afgekeurd', at: '2026-11-03T10:12:00.000Z', agent: 'user', person: sessions.abb.personUuid, organisation: IDS.abb, rule: 'abb-decides-all', reason: 'Fout KBO-nummer', error: null, 'overrides-conflict': false, 'overridden-conflicts': [],
+  });
+  assert.equal(rejected.attributes.status, 'afgekeurd');
+  assert.equal(rejected.attributes['applied-at'], null);
+});
 
-test('a failed request is applied again from its stored versions', async () => {
-  const db = fakeDb({ requests: [failedRequest], storedVersions });
-  const { status, document } = await service(db).apply(sessions.orgA, 'r2');
-  assert.equal(status, 200);
-  assert.equal(document.id, 'r2');
+test('a pending request shows its live conflicts, in the list and alone; a decided request is not checked', async () => {
+  const pending = { requests: [requestRow(5, 'ingediend'), requestRow(6, 'goedgekeurd')], steps: [stepRow(5, 1, 'indiening', 'ingediend'), stepRow(6, 1, 'indiening', 'ingediend'), stepRow(6, 2, 'goedkeuring', 'goedgekeurd', serviceStep)], storedVersions: [...storedRename(5), ...storedRename(6)] };
+  const renamed = fakeDb({ ...pending, master: withName('Aalst (ABB)') });
+  const { documents: list } = await service(renamed).list(sessions.orgA, { target: IDS.org });
+  assert.deepEqual(list.find((d) => d.id === RID(5)).attributes.conflicts, [nameConflict]);
+  assert.deepEqual(list.find((d) => d.id === RID(6)).attributes.conflicts, [], 'a decided request is not checked against the current values');
+  assert.deepEqual(list.find((d) => d.id === RID(6)).attributes.steps[1]['overridden-conflicts'], [], 'its goedkeuring replaced no states here, so it overrode nothing');
+  assert.equal((await service(renamed).get(sessions.orgA, RID(5))).attributes.conflicts.length, 1);
+  assert.deepEqual((await service(fakeDb(pending)).get(sessions.orgA, RID(5))).attributes.conflicts, [], 'nothing changed since: no conflict');
+});
+
+// --- POST /change-requests/:id/steps ------------------------------------------------------------
+
+const step = (stepType, attributes = {}) => ({ data: { type: 'change-request-steps', attributes: { 'step-type': stepType, ...attributes } } });
+const pendingDb = (options = {}) => fakeDb({ requests: [requestRow(5, 'ingediend')], steps: [stepRow(5, 1, 'indiening', 'ingediend')], storedVersions: storedRename(5), ...options });
+
+test('ABB approves a pending request: the stored versions are applied with its goedkeuring step', async () => {
+  const db = pendingDb();
+  const { status, document } = await service(db).addStep(sessions.abb, RID(5), step('goedkeuring'));
+  assert.equal(status, 201);
   assert.equal(document.attributes.status, 'goedgekeurd');
+  assert.deepEqual(document.attributes.steps[1], userStep(sessions.abb, { sequence: 2, type: 'goedkeuring', status: 'goedgekeurd', rule: 'abb-decides-all' }));
   assert.equal(document.attributes['applied-at'], '2026-11-03T10:12:00.000Z');
-  assert.equal(document.attributes.error, undefined);
-  assert.equal(db.updates.length, 1, 'the apply only');
+  assert.equal(db.updates.length, 1);
   const apply = db.updates[0];
-  assert.ok(apply.includes(`VALUES ?s { <${URIS.address}> }\n    VALUES ?p { <${NS.locn}thoroughfare> <${NS.adres}Adresvoorstelling.huisnummer> }`), 'replaces the stored predicates, sorted');
-  assert.ok(apply.includes(`<${URIS.address}> <${NS.locn}thoroughfare> """Nieuwe straat""" .`));
-  assert.ok(apply.includes(`<http://data.lblod.info/id/contact-punten/new1> a <${NS.schema}ContactPoint> ;\n      mu:uuid """new1""" ;\n      <${NS.schema}email> """info@aalst.be""" .`), 'a stored create inserts its class and uuid again');
-  assert.ok(apply.includes(`<http://data.lblod.info/id/change-requests/r2> cr:error ?oldError`), 'the error of the failed attempt goes');
-  assert.ok(apply.includes(`<${URIS.org}> dct:modified`) && apply.includes(`ext:lastModifiedBy <${URIS.account}>`), 'stamped with the account of the request');
-  assert.ok(db.queries.some((q) => q.includes('SELECT ?request ?uuid ?created ?appliedAt') && q.includes(`cr:target <${URIS.org}>`) && q.includes('"2026-11-03T10:12:00.000Z"^^xsd:dateTime')));
+  assert.ok(apply.includes(`<${URIS.org}> <${prefLabel}> """Aalst (A)""" .`), 'the stored proposal');
+  assert.ok(apply.includes(`dct:type <${STEP_TYPE.goedkeuring}> ;\n      adms:status <${STATUS.goedgekeurd}> ;\n      schema:position "2"^^xsd:integer ;`));
+  assert.ok(apply.includes(`prov:wasAssociatedWith <${URIS.personAbb}> ;\n      cr:actingOrganisation <${URIS.abb}> ;\n      cr:rule """abb-decides-all""" ;\n      prov:invalidated <`));
+  assert.ok(apply.includes(`dct:isVersionOf <${URIS.org}> ;\n      <${prefLabel}> """Aalst""" .`), 'the state it replaced: the name as the form had it, so nothing overridden');
+  assert.equal(document.attributes.steps[1]['overrides-conflict'], false);
+  assert.ok(apply.includes(`ext:lastModifiedBy <${URIS.person}>`), 'the stamp names the person who submitted the change');
+});
+
+test('a goedkeuring re-checks the conflicts: 409 with them and their token; with that token as override it applies, and the step records what it overrode', async () => {
+  const conflicted = pendingDb({ master: withName('Aalst (ABB)') });
+  let token;
+  await assert.rejects(() => service(conflicted).addStep(sessions.abb, RID(5), step('goedkeuring')), (error) => {
+    assert.equal(error.status, 409);
+    assert.deepEqual(error.meta.conflicts, [nameConflict]);
+    token = error.meta['conflicts-token'];
+    assert.match(token, /^[0-9a-f]{64}$/);
+    assert.ok(error.detail.endsWith(`approve with "override": "${token}" to apply it anyway`), error.detail);
+    return true;
+  });
+  assert.equal((await service(conflicted).get(sessions.abb, RID(5))).attributes['conflicts-token'], token, 'GET shows the same token');
+  assert.equal(conflicted.updates.length, 0);
+  const { document } = await service(conflicted).addStep(sessions.abb, RID(5), step('goedkeuring', { override: token }));
+  assert.equal(document.attributes.status, 'goedgekeurd');
+  const { 'competing-requests': _competing, ...overridden } = nameConflict;
+  assert.equal(document.attributes.steps[1]['overrides-conflict'], true);
+  assert.deepEqual(document.attributes.steps[1]['overridden-conflicts'], [overridden]);
+  assert.ok(conflicted.updates[0].includes(`dct:isVersionOf <${URIS.org}> ;\n      <${prefLabel}> """Aalst (ABB)""" .`), 'the state the step replaced keeps the name it overwrote');
+  assert.ok(!conflicted.updates[0].includes('overrid'), 'no JSON of the conflicts');
+});
+
+test('a decided request shows the conflicts its goedkeuring overrode, derived from the states it replaced', async () => {
+  const decided = (name) =>
+    fakeDb({
+      requests: [requestRow(6, 'goedgekeurd')],
+      steps: [stepRow(6, 1, 'indiening', 'ingediend'), stepRow(6, 2, 'goedkeuring', 'goedgekeurd', { agent: URIS.personAbb, agentUuid: sessions.abb.personUuid, organisation: URIS.abb, organisationUuid: IDS.abb, rule: 'abb-decides-all' })],
+      storedVersions: storedRename(6),
+      replacedStates: replacedState(6, 2, { values: [[prefLabel, literal(name)]] }),
+      master: withName('Aalst (A)'),
+    });
+  const { 'competing-requests': _competing, ...overridden } = nameConflict;
+  const [, approval] = (await service(decided('Aalst (ABB)')).get(sessions.orgA, RID(6))).attributes.steps;
+  assert.deepEqual([approval['overrides-conflict'], approval['overridden-conflicts']], [true, [overridden]], 'ABB had renamed it: the approval overwrote that');
+  const [, plain] = (await service(decided('Aalst')).get(sessions.orgA, RID(6))).attributes.steps;
+  assert.deepEqual([plain['overrides-conflict'], plain['overridden-conflicts']], [false, []], 'as the form had it: nothing overridden');
+});
+
+test('an override covers the conflicts the approver reviewed and no others: a change made since gives another 409 and token', async () => {
+  const legalName = `${NS.regorg}legalName`;
+  // R5 renames the organisation (from "Aalst") and sets its legal name (empty when the form loaded it)
+  const keys = [
+    { predicate: prefLabel, proposed: [literal('Aalst (A)')], base: [literal('Aalst')] },
+    { predicate: legalName, proposed: [literal('Stad Aalst')], base: [] },
+  ];
+  const db = pendingDb({ storedVersions: storedVersion(5, { keys }), master: withName('Aalst (ABB)') });
+  const reviewed = (await service(db).get(sessions.abb, RID(5))).attributes;
+  assert.deepEqual(reviewed.conflicts.map((conflict) => conflict.key), ['name']);
+  // while ABB reviews, a fresh form sets the legal name
+  db.state.master[`${URIS.org} ${legalName}`] = [literal('Stad Aalst NV')];
+  await assert.rejects(() => service(db).addStep(sessions.abb, RID(5), step('goedkeuring', { override: reviewed['conflicts-token'] })), (error) => {
+    assert.equal(error.status, 409);
+    assert.deepEqual(error.meta.conflicts.map((conflict) => [conflict.key, conflict.current]), [['name', 'Aalst (ABB)'], ['legal-name', 'Stad Aalst NV']]);
+    assert.notEqual(error.meta['conflicts-token'], reviewed['conflicts-token']);
+    assert.match(error.detail, /^The conflicts changed since they were reviewed: 2 conflicts now/);
+    return true;
+  });
+  assert.equal(db.updates.length, 0, 'the newer legal name is not overwritten');
+});
+
+test('a request that updates a record deleted since cannot be applied, also not with override; it is rejected or withdrawn, also once its apply failed', async () => {
+  const siteTypeName = `${NS.dct}description`;
+  const siteRename = storedVersion(5, { master: URIS.site, masterUuid: IDS.site, type: 'sites', keys: [{ predicate: siteTypeName, proposed: [literal('C')], base: [literal('A')] }] });
+  const deleted = { ...masterState(), [`${URIS.site} ${NS.rdf}type`]: [] };
+  const db = pendingDb({ storedVersions: siteRename, master: deleted });
+  const shown = (await service(db).get(sessions.abb, RID(5))).attributes;
+  assert.deepEqual(shown.conflicts, [{ resource: { type: 'sites', id: IDS.site }, key: 'site-type-name', base: 'A', current: null, proposed: 'C', 'master-exists': false, 'competing-requests': [] }]);
+  const missing = { status: 409, title: 'The change request changes records that no longer exist', meta: { 'missing-records': [{ type: 'sites', id: IDS.site }] } };
+  await assert.rejects(() => service(db).addStep(sessions.abb, RID(5), step('goedkeuring')), missing);
+  await assert.rejects(() => service(db).addStep(sessions.abb, RID(5), step('goedkeuring', { override: shown['conflicts-token'] })), missing, 'override cannot pass');
+  assert.equal(db.updates.length, 0);
+  const failed = () => failedDb({ storedVersions: storedVersion(2, { master: URIS.site, masterUuid: IDS.site, type: 'sites', keys: [{ predicate: siteTypeName, proposed: [literal('C')], base: [literal('A')] }] }), master: deleted });
+  await assert.rejects(() => service(failed()).addStep(sessions.orgA, RID(2), step('hertoepassing')), missing);
+  const rejected = await service(failed()).addStep(sessions.abb, RID(2), step('afkeuring', { reason: 'De vestiging bestaat niet meer' }));
+  assert.deepEqual(rejected.document.attributes.steps.map((s) => [s.sequence, s.type, s.status]).at(-1), [3, 'afkeuring', 'afgekeurd']);
+  const withdrawn = await service(failed()).addStep(sessions.orgA, RID(2), step('intrekking'));
+  assert.equal(withdrawn.document.attributes.status, 'ingetrokken');
+});
+
+test('ABB rejects a pending request with a reason (afkeuring); a rejection needs a reason', async () => {
+  const db = pendingDb();
+  const { status, document } = await service(db).addStep(sessions.abb, RID(5), step('afkeuring', { reason: 'Het KBO-nummer hoort bij een andere organisatie' }));
+  assert.equal(status, 201);
+  assert.equal(document.attributes.status, 'afgekeurd');
+  assert.deepEqual(document.attributes.steps[1], userStep(sessions.abb, { sequence: 2, type: 'afkeuring', status: 'afgekeurd', rule: 'abb-decides-all', reason: 'Het KBO-nummer hoort bij een andere organisatie' }));
+  assert.equal(db.updates.length, 1);
+  assert.ok(!db.updates[0].includes('http://mu.semte.ch/application'), 'nothing is applied');
+  assert.ok(db.updates[0].includes(`adms:status <${STATUS.afgekeurd}> .\n    <`) && db.updates[0].includes('dct:description """Het KBO-nummer hoort bij een andere organisatie"""'));
+  for (const reason of [undefined, '', '   ']) {
+    await assert.rejects(() => service(pendingDb()).addStep(sessions.abb, RID(5), step('afkeuring', reason === undefined ? {} : { reason })), { status: 422, detail: 'an afkeuring needs a reason', pointer: '/data/attributes/reason' });
+  }
+});
+
+test('the requesting organisation or ABB withdraws a pending request (intrekking); the target of a request by another does not', async () => {
+  const db = pendingDb();
+  const { document } = await service(db).addStep(sessions.orgA, RID(5), step('intrekking'));
+  assert.equal(document.attributes.status, 'ingetrokken');
+  assert.deepEqual(document.attributes.steps[1], userStep(sessions.orgA, { sequence: 2, type: 'intrekking', status: 'ingetrokken', rule: 'requesting-organisation' }));
+  assert.equal((await service(pendingDb()).addStep(sessions.abb, RID(5), step('intrekking'))).document.attributes.steps[1].rule, 'abb-edits-all');
+  const byAbb = fakeDb({ requests: [requestRow(5, 'ingediend', { requestingOrganisation: URIS.abb, requestingOrganisationUuid: IDS.abb })], steps: [stepRow(5, 1, 'indiening', 'ingediend')] });
+  await assert.rejects(() => service(byAbb).addStep(sessions.orgA, RID(5), step('intrekking')), { status: 403, meta: { rule: null, rules: [] } });
+  assert.equal(byAbb.updates.length, 0);
+});
+
+test('only ABB decides: an organisation approving or rejecting is a 403, a request it cannot see a 404', async () => {
+  for (const [stepType, attributes] of [['goedkeuring', {}], ['afkeuring', { reason: 'nee' }]]) {
+    const db = pendingDb();
+    await assert.rejects(() => service(db).addStep(sessions.orgA, RID(5), step(stepType, attributes)), { status: 403, title: `Not allowed to take a ${stepType} step on this change request`, meta: { rule: null, rules: [] } });
+    assert.equal(db.updates.length, 0);
+  }
+  await assert.rejects(() => service(pendingDb()).addStep(sessions.orgB, RID(5), step('goedkeuring')), { status: 404 });
+});
+
+const STEPS_BY_STATUS = {
+  ingediend: [[1, 'indiening', 'ingediend']],
+  goedgekeurd: [[1, 'indiening', 'ingediend'], [2, 'goedkeuring', 'goedgekeurd']],
+  afgekeurd: [[1, 'indiening', 'ingediend'], [2, 'afkeuring', 'afgekeurd']],
+  ingetrokken: [[1, 'indiening', 'ingediend'], [2, 'intrekking', 'ingetrokken']],
+  mislukt: [[1, 'indiening', 'ingediend'], [2, 'goedkeuring', 'mislukt']],
+};
+const ALLOWED = { ingediend: ['goedkeuring', 'afkeuring', 'intrekking'], mislukt: ['hertoepassing', 'afkeuring', 'intrekking'] };
+
+test('every step the status does not admit is a 409; goedgekeurd, afgekeurd and ingetrokken are final', async () => {
+  for (const [status, trail] of Object.entries(STEPS_BY_STATUS)) {
+    for (const stepType of ['indiening', 'goedkeuring', 'afkeuring', 'intrekking', 'hertoepassing']) {
+      if (ALLOWED[status]?.includes(stepType)) continue;
+      const db = fakeDb({ requests: [requestRow(1, status)], steps: trail.map(([sequence, type, stepStatus]) => stepRow(1, sequence, type, stepStatus)), storedVersions: storedRename(1) });
+      await assert.rejects(() => service(db).addStep(sessions.abb, RID(1), step(stepType, { reason: 'x' })), (error) => {
+        assert.equal(error.status, 409, `${stepType} after ${status}`);
+        assert.match(error.detail, new RegExp(`^Change request "${RID(1)}" has status ${status}`));
+        assert.deepEqual(error.meta, { status, 'step-type': stepType });
+        return true;
+      });
+      assert.equal(db.updates.length, 0);
+    }
+  }
+});
+
+test('unknown step types and malformed bodies are a 422; wijziging is reserved', async () => {
+  const refused = async (payload, expected) => assert.rejects(() => service(pendingDb()).addStep(sessions.abb, RID(5), payload), { status: 422, ...expected });
+  await refused(step('goedkeuren'), { detail: 'unknown step type "goedkeuren"; one of goedkeuring, afkeuring, intrekking, hertoepassing', pointer: '/data/attributes/step-type' });
+  await refused({ data: { type: 'change-request-steps', attributes: {} } }, { pointer: '/data/attributes/step-type' });
+  await refused(step('wijziging'), { detail: 'the step type "wijziging" is reserved and not implemented' });
+  await refused({ data: { type: 'steps', attributes: { 'step-type': 'goedkeuring' } } }, { pointer: '/data/type' });
+  await refused({}, { pointer: '/data' });
+  await refused(step('goedkeuring', { reason: 42 }), { detail: '"reason" must be a string' });
+  for (const override of [true, 42, '']) await refused(step('goedkeuring', { override }), { detail: /^"override" must be the "conflicts-token" of the conflicts you reviewed/, pointer: '/data/attributes/override' });
+});
+
+test('a step follows the last step', async () => {
+  const sequenceOf = (q) => q.match(/schema:position "(\d+)"/)[1];
+  const pending = pendingDb();
+  await service(pending).addStep(sessions.orgA, RID(5), step('intrekking'));
+  assert.equal(sequenceOf(pending.updates[0]), '2');
+  const retried = fakeDb({ requests: [requestRow(1, 'mislukt')], steps: STEPS_BY_STATUS.mislukt.map(([sequence, type, status]) => stepRow(1, sequence, type, status)), storedVersions: storedRename(1) });
+  const { document } = await service(retried).addStep(sessions.orgA, RID(1), step('hertoepassing'));
+  assert.equal(sequenceOf(retried.updates[0]), '3');
+  assert.deepEqual(document.attributes.steps.map((s) => [s.sequence, s.type, s.status]), [[1, 'indiening', 'ingediend'], [2, 'goedkeuring', 'mislukt'], [3, 'hertoepassing', 'goedgekeurd']]);
+  assert.equal(document.attributes.error, null);
+});
+
+// --- hertoepassing and its alias POST /change-requests/:id/apply -----------------------------------
+
+const failedDb = (options = {}) =>
+  fakeDb({ requests: [requestRow(2, 'mislukt')], steps: STEPS_BY_STATUS.mislukt.map(([sequence, type, status]) => stepRow(2, sequence, type, status, type === 'goedkeuring' ? { ...serviceStep, error: 'Virtuoso said no' } : {})), storedVersions: storedRename(2), ...options });
+
+test('a failed request is applied again from its stored versions (hertoepassing); /apply is its alias, answered with 200', async () => {
+  const db = failedDb();
+  const { status, document } = await service(db).apply(sessions.orgA, RID(2));
+  assert.equal(status, 200);
+  assert.equal(document.id, RID(2));
+  assert.equal(document.attributes.status, 'goedgekeurd');
+  assert.equal(document.attributes.error, null);
+  assert.deepEqual(document.attributes.steps.at(-1), userStep(sessions.orgA, { sequence: 3, type: 'hertoepassing', status: 'goedgekeurd', rule: 'own-organisation' }));
+  assert.equal(db.updates.length, 1, 'the apply only');
+  assert.ok(db.updates[0].includes(`VALUES ?s { <${URIS.org}> }\n    VALUES ?p { <${prefLabel}> }`));
+  assert.ok(db.updates[0].includes(`dct:type <${STEP_TYPE.hertoepassing}>`));
+  const later = db.queries.find((q) => q.includes('SELECT DISTINCT ?request ?uuid ?appliedAt'));
+  assert.ok(later.includes(`cr:target <${URIS.org}>`) && later.includes(`FILTER(?request != <${REQUEST(2)}>)`));
+  assert.ok(later.includes('FILTER(?appliedAt > "2026-11-03T10:12:00.000Z"^^xsd:dateTime)'), 'applied after the failed step');
+  assert.equal((await service(failedDb()).addStep(sessions.orgA, RID(2), step('hertoepassing'))).status, 201, 'through /steps: 201');
 });
 
 test('applying again is refused for a request that did not fail, that is not visible, or that another organisation may not edit', async () => {
-  await assert.rejects(() => service(fakeDb({ requests: [storedRequest], storedVersions })).apply(sessions.orgA, 'r1'), { status: 409, detail: 'Change request "r1" has status goedgekeurd' });
-  await assert.rejects(() => service(fakeDb({ requests: [failedRequest], storedVersions })).apply(sessions.orgB, 'r2'), { status: 404 });
-  const abbRequestOnA = { ...failedRequest, uuid: 'r3', request: 'http://data.lblod.info/id/change-requests/r3', requestingOrganisation: URIS.abb, requestingOrganisationUuid: IDS.abb };
-  const asB = fakeDb({ requests: [{ ...abbRequestOnA, target: URIS.orgB, targetUuid: IDS.orgB }], storedVersions });
-  await assert.rejects(() => service(asB).apply(sessions.orgA, 'r3'), { status: 404 }, 'not visible to A');
-  const visibleButDenied = fakeDb({ requests: [{ ...abbRequestOnA, requestingOrganisation: URIS.orgB, requestingOrganisationUuid: IDS.orgB }], storedVersions });
-  await assert.rejects(() => service(visibleButDenied).apply(sessions.orgB, 'r3'), { status: 403 }, 'B submitted it (sees it) but may not edit A');
-  const { status } = await service(fakeDb({ requests: [abbRequestOnA], storedVersions })).apply(sessions.abb, 'r3');
-  assert.equal(status, 200, 'ABB may');
+  const approved = fakeDb({ requests: [abbRequest] });
+  await assert.rejects(() => service(approved).apply(sessions.orgA, RID(1)), { status: 409, detail: `Change request "${RID(1)}" has status goedgekeurd, which is final; no hertoepassing can follow` });
+  await assert.rejects(() => service(failedDb()).apply(sessions.orgB, RID(2)), { status: 404 });
+  const bySubmitter = failedDb();
+  bySubmitter.state.requests[0] = { ...bySubmitter.state.requests[0], requestingOrganisation: URIS.orgB, requestingOrganisationUuid: IDS.orgB };
+  await assert.rejects(() => service(bySubmitter).apply(sessions.orgB, RID(2)), { status: 403 }, 'B submitted it (sees it) but may not edit A');
+  assert.equal((await service(failedDb()).apply(sessions.abb, RID(2))).status, 200, 'ABB may');
 });
 
-test('applying again is refused when a later request on the organisation was applied since', async () => {
-  const db = fakeDb({ requests: [failedRequest], storedVersions, laterApplied: [{ request: 'http://data.lblod.info/id/change-requests/r9', uuid: 'r9', created: '2026-11-03T11:00:00Z', appliedAt: '2026-11-03T11:00:01Z' }] });
-  await assert.rejects(() => service(db).apply(sessions.orgA, 'r2'), {
+test('applying again is refused when a request on the organisation was applied after this one failed', async () => {
+  const db = failedDb({ laterApplied: [{ request: REQUEST(9), uuid: RID(9), appliedAt: '2026-11-03T11:00:01Z' }] });
+  await assert.rejects(() => service(db).apply(sessions.orgA, RID(2)), {
     status: 409,
-    detail: 'Change request "r9" was applied on 2026-11-03T11:00:01.000Z; submit the change again instead of applying this one',
+    detail: `Change request "${RID(9)}" was applied on 2026-11-03T11:00:01.000Z; submit the change again instead of applying this one`,
   });
   assert.equal(db.updates.length, 0);
-  await assert.rejects(() => service(fakeDb({ requests: [failedRequest], storedVersions: [] })).apply(sessions.orgA, 'r2'), { status: 409, detail: /Nothing is stored/ });
 });
 
-test('a failed re-apply keeps the request mislukt and answers 409', async () => {
-  const db = fakeDb({ requests: [failedRequest], storedVersions, failApply: 2 });
-  await assert.rejects(() => service(db).apply(sessions.orgA, 'r2'), { status: 409, meta: { 'change-request': { id: 'r2', status: 'mislukt' } } });
+test('a failed re-apply records the hertoepassing as mislukt and answers 409', async () => {
+  const db = failedDb({ failApply: 2 });
+  await assert.rejects(() => service(db).apply(sessions.orgA, RID(2)), { status: 409, meta: { 'change-request': { id: RID(2), status: 'mislukt' } } });
   assert.equal(db.updates.length, 3, 'two attempts and the failure record');
-  assert.ok(db.updates[2].includes(`<${STATUS.mislukt}>`));
+  assert.ok(db.updates[2].includes(`dct:type <${STEP_TYPE.hertoepassing}> ;\n      adms:status <${STATUS.mislukt}> ;\n      schema:position "3"^^xsd:integer ;`));
+  assert.ok(db.updates[2].includes('oslc:message """Virtuoso said no"""'));
+});
+
+// --- simultaneous requests ------------------------------------------------------------------------
+
+/** onUpdate: an apply of a rename changes the name on the master, as the triplestore would. */
+const applyRenames = (q, state) => {
+  if (!isApply(q)) return;
+  const name = q.match(new RegExp(`<${URIS.org}> <${prefLabel}> """([^"]+)"""`))?.[1];
+  if (name) state.master[`${URIS.org} ${prefLabel}`] = [literal(name)];
+};
+
+test('two simultaneous submissions on the same organisation are serialised: the second sees the first one applied', async () => {
+  const db = fakeDb({ onUpdate: applyRenames });
+  const shared = service(db);
+  const [first, second] = await Promise.all([shared.create(sessions.orgA, rename('Aalst (1)', 'Aalst')), shared.create(sessions.orgA, rename('Aalst (2)', 'Aalst'))]);
+  assert.equal(first.document.attributes.status, 'goedgekeurd');
+  assert.equal(second.document.attributes.status, 'ingediend', 'both forms started from "Aalst": the second one conflicts');
+  assert.deepEqual(second.document.attributes.conflicts.map(({ base, current, proposed }) => [base, current, proposed]), [['Aalst', 'Aalst (1)', 'Aalst (2)']]);
+  const firstApply = db.log.findIndex(([kind, q]) => kind === 'update' && isApply(q));
+  const reads = db.log.map(([kind, q], index) => (kind === 'query' && q.includes('SELECT ?s ?p ?o') ? index : -1)).filter((index) => index >= 0);
+  assert.ok(reads[0] < firstApply && reads[1] > firstApply, 'the second read of the current values comes after the first apply');
+});
+
+test('without a shared lock (two service instances) both would be applied: the lock is per instance', async () => {
+  const db = fakeDb({ onUpdate: applyRenames });
+  const [first, second] = await Promise.all([service(db).create(sessions.orgA, rename('Aalst (1)', 'Aalst')), service(db).create(sessions.orgA, rename('Aalst (2)', 'Aalst'))]);
+  assert.deepEqual([first.document.attributes.status, second.document.attributes.status], ['goedgekeurd', 'goedgekeurd']);
+});
+
+test('two steps on the same request at once: the second sees the status the first one left', async () => {
+  const db = pendingDb({ onUpdate: recordSteps });
+  const shared = service(db);
+  const [approval, withdrawal] = await Promise.allSettled([shared.addStep(sessions.abb, RID(5), step('goedkeuring')), shared.addStep(sessions.orgA, RID(5), step('intrekking'))]);
+  assert.equal(approval.status, 'fulfilled');
+  assert.equal(approval.value.document.attributes.status, 'goedgekeurd');
+  assert.equal(withdrawal.status, 'rejected');
+  assert.equal(withdrawal.reason.status, 409);
+  assert.match(withdrawal.reason.detail, /has status goedgekeurd, which is final/);
+  assert.equal(db.updates.length, 1, 'one step written, sequence 2 only once');
+});
+
+// --- deletes, merges and competing requests ---------------------------------------------------------
+
+const email = `${NS.schema}email`;
+const contactsOf = (site, contacts) => ({ [`${site} ${NS.org}siteAddress`]: contacts.map(uri) });
+
+test('a delete from a stale form: a value set on the record since the page loaded it is a conflict, and the request waits', async () => {
+  // the page loaded the old contact point with e0@aalst.be; someone set e1 since
+  const db = fakeDb({ master: { ...masterState(), [`${URIS.oldContact} ${email}`]: [literal('e1@aalst.be')] } });
+  const ops = [
+    { op: 'update', data: { type: 'sites', id: IDS.site, relationships: { contacts: { data: [] } }, meta: { base: { relationships: { contacts: { data: [{ type: 'contact-points', id: IDS.oldContact }] } } } } } },
+    { op: 'delete', data: { type: 'contact-points', id: IDS.oldContact, meta: { base: { attributes: { email: 'e0@aalst.be', telephone: null } } } } },
+  ];
+  const { document } = await service(db).create(sessions.orgA, body(IDS.org, 'organization-core-data', ops));
+  assert.equal(document.attributes.status, 'ingediend');
+  assert.deepEqual(document.attributes.conflicts, [
+    { resource: { type: 'contact-points', id: IDS.oldContact }, key: 'email', base: 'e0@aalst.be', current: 'e1@aalst.be', proposed: null, 'master-exists': true, 'competing-requests': [] },
+  ]);
+  assert.equal(db.updates.length, 1, 'held: nothing applied');
+  const [insert] = db.updates;
+  assert.ok(insert.includes(`cr:operation <${OPERATION.delete}> ;\n      cr:changesProperty `), 'the tombstone changes every key');
+  assert.ok(insert.includes(`<${email}> """e0@aalst.be"""`), 'its base is what the page loaded');
+  assert.ok(insert.includes(`rdf:subject <${URIS.site}> ;\n      rdf:predicate <${NS.org}siteAddress> ;\n      rdf:object <${URIS.oldContact}> .`), 'and the link the site had to it');
+  // the same delete from a page that loaded e1 goes through
+  const fresh = fakeDb({ master: { ...masterState(), [`${URIS.oldContact} ${email}`]: [literal('e1@aalst.be')] } });
+  ops[1].data.meta.base.attributes.email = 'e1@aalst.be';
+  assert.equal((await service(fresh).create(sessions.orgA, body(IDS.org, 'organization-core-data', ops))).document.attributes.status, 'goedgekeurd');
+});
+
+/** Pending request 5 deletes the old contact point; when it was submitted its email was e0 and only the site linked it. */
+const pendingDelete = (master) =>
+  pendingDb({
+    storedVersions: storedVersion(5, {
+      operation: 'delete',
+      master: URIS.oldContact,
+      masterUuid: IDS.oldContact,
+      type: 'contact-points',
+      keys: [{ predicate: email, base: [literal('e0@aalst.be')] }, { predicate: `${NS.schema}telephone` }],
+      links: [{ predicate: `${NS.org}siteAddress`, subject: URIS.site }],
+    }),
+    master: { ...masterState(), [`${URIS.oldContact} ${email}`]: [literal('e0@aalst.be')], ...master },
+    records: { [URIS.siteB]: { uuid: IDS.siteB, classes: [`${NS.org}Site`] } },
+  });
+
+test('a pending delete is checked live: an edit or a new link made since it was submitted is a conflict before ABB approves it', async () => {
+  assert.deepEqual((await service(pendingDelete()).get(sessions.abb, RID(5))).attributes.conflicts, [], 'nothing changed since');
+  const edited = pendingDelete({ [`${URIS.oldContact} ${email}`]: [literal('e1@aalst.be')] });
+  await assert.rejects(() => service(edited).addStep(sessions.abb, RID(5), step('goedkeuring')), (error) => {
+    assert.equal(error.status, 409);
+    assert.deepEqual(error.meta.conflicts.map(({ resource, key, base, current, proposed }) => [resource.id, key, base, current, proposed]), [[IDS.oldContact, 'email', 'e0@aalst.be', 'e1@aalst.be', null]]);
+    return true;
+  });
+  // another site links the contact point now: deleting it would take it from that site
+  const linked = pendingDelete(contactsOf(URIS.siteB, [URIS.oldContact]));
+  const shown = (await service(linked).get(sessions.abb, RID(5))).attributes;
+  assert.deepEqual(shown.conflicts, [
+    { resource: { type: 'sites', id: IDS.siteB }, key: 'contacts', base: [], current: [{ type: 'contact-points', id: IDS.oldContact }], proposed: [], 'master-exists': true, 'competing-requests': [] },
+  ]);
+  await assert.rejects(() => service(linked).addStep(sessions.abb, RID(5), step('goedkeuring')), { status: 409 });
+  const { document } = await service(linked).addStep(sessions.abb, RID(5), step('goedkeuring', { override: shown['conflicts-token'] }));
+  assert.equal(document.attributes.status, 'goedgekeurd', 'ABB may still delete it, knowingly');
+  assert.ok(linked.updates[0].includes(`VALUES ?o { <${URIS.oldContact}> }`));
+});
+
+/** onUpdate: an apply adds the sites it links to the organisation, as the triplestore would. */
+const applySites = (q, state) => {
+  if (!isApply(q)) return;
+  const linked = [...q.matchAll(new RegExp(`<${URIS.org}> <${NS.org}hasSite> <([^>]+)> \\.`, 'g'))].map((m) => m[1]);
+  const key = `${URIS.org} ${NS.org}hasSite`;
+  state.master[key] = [...(state.master[key] || []), ...linked.map(uri)];
+};
+
+test('two pages that each add a vestiging at the same time: both are linked; the second merges instead of conflicting', async () => {
+  const db = fakeDb({ onUpdate: applySites });
+  const shared = service(db);
+  const addSite = (lid, name) =>
+    body(IDS.org, 'site', [
+      { op: 'create', data: { type: 'sites', lid, attributes: { 'site-type-name': name } } },
+      {
+        op: 'update',
+        data: {
+          type: 'administrative-units',
+          id: IDS.org,
+          relationships: { sites: { data: [{ type: 'sites', id: IDS.site }, { type: 'sites', lid }] } },
+          meta: { base: { relationships: { sites: { data: [{ type: 'sites', id: IDS.site }] } } } },
+        },
+      },
+    ]);
+  const [first, second] = await Promise.all([shared.create(sessions.orgA, addSite('n1', 'Eerste')), shared.create(sessions.orgA, addSite('n2', 'Tweede'))]);
+  assert.deepEqual([first.document.attributes.status, second.document.attributes.status], ['goedgekeurd', 'goedgekeurd']);
+  assert.deepEqual(second.document.attributes.conflicts, []);
+  const [n1, n2] = [first, second].map(({ document }) => `http://data.lblod.info/id/vestigingen/${Object.values(document.attributes.lids)[0]}`);
+  assert.deepEqual(db.state.master[`${URIS.org} ${NS.org}hasSite`].map((binding) => binding.value), [URIS.site, n1, n2]);
+  const secondApply = db.updates.filter(isApply)[1];
+  assert.ok(!secondApply.includes(`VALUES ?p { <${NS.org}hasSite> }`), 'the sites are not replaced, so the first new site stays linked');
+});
+
+// --- superseding: a newer applied request withdraws the older pending one it replaces ----------
+
+const YESTERDAY = { created: '2026-11-02T09:00:00Z' };
+
+test('a newer request of the same organisation that rewrites every key of its older pending request replaces it: the service withdraws the older one, naming the newer', async () => {
+  // R5 is pending: a stale form proposed "Aalst (A)"; ABB renamed the organisation since. A fresh form of the same organisation proposes another name.
+  const db = pendingDb({ master: withName('Aalst (ABB)'), requests: [requestRow(5, 'ingediend', YESTERDAY)], onUpdate: recordSteps });
+  const { document } = await service(db).create(sessions.orgA, rename('Aalst (Y)', 'Aalst (ABB)'));
+  assert.equal(document.attributes.status, 'goedgekeurd', 'no conflict: it is applied');
+  assert.deepEqual(document.attributes.conflicts, []);
+  assert.deepEqual(document.attributes.superseded, [RID(5)]);
+  assert.deepEqual(document.attributes.competing, [], 'the replaced request no longer competes');
+  const withdrawal = db.updates.at(-1);
+  assert.ok(withdrawal.includes(`dct:type <${STEP_TYPE.intrekking}> ;\n      adms:status <${STATUS.ingetrokken}> ;\n      schema:position "2"^^xsd:integer ;`), withdrawal);
+  assert.ok(withdrawal.includes(`<${REQUEST(5)}> adms:status <${STATUS.ingetrokken}> ;\n      dct:isReplacedBy <http://data.lblod.info/id/change-requests/${document.id}> .`), 'the older request names the newer one');
+  assert.ok(
+    withdrawal.includes(
+      `prov:wasAssociatedWith <${SERVICE_AGENT}> ;\n      cr:rule """superseded-by-own-request""" ;\n      dct:description """Vervangen door wijzigingsaanvraag ${document.id}""" .`,
+    ),
+    withdrawal,
+  );
+  assert.ok(!withdrawal.includes('http://mu.semte.ch/application'), 'a withdrawal changes no data');
+  const old = (await service(db).get(sessions.orgA, RID(5))).attributes;
+  assert.equal(old.status, 'ingetrokken');
+  assert.deepEqual([old.steps.at(-1).type, old.steps.at(-1).agent], ['intrekking', 'service']);
+  assert.equal(old['replaced-by'], document.id);
+});
+
+test('a pending request of another organisation is not replaced: it keeps waiting and is named as competing', async () => {
+  const db = pendingDb({
+    master: withName('Aalst (ABB)'),
+    requests: [requestRow(5, 'ingediend', { ...YESTERDAY, requestingOrganisation: URIS.abb, requestingOrganisationUuid: IDS.abb })],
+  });
+  const { document } = await service(db).create(sessions.orgA, rename('Aalst (Y)', 'Aalst (ABB)'));
+  assert.equal(document.attributes.status, 'goedgekeurd');
+  assert.deepEqual(document.attributes.superseded, []);
+  assert.deepEqual(document.attributes.competing, [{ resource: { type: 'administrative-units', id: IDS.org }, key: 'name', proposed: 'Aalst (Y)', 'competing-requests': [RID(5)] }]);
+  assert.ok(!db.updates.some((q) => q.includes(`<${STEP_TYPE.intrekking}>`)), 'no withdrawal');
+});
+
+test('an older request that also proposes keys the newer one did not rewrite keeps waiting', async () => {
+  const keys = [
+    { predicate: prefLabel, proposed: [literal('Aalst (A)')], base: [literal('Aalst')] },
+    { predicate: `${NS.regorg}legalName`, proposed: [literal('Stad Aalst')], base: [] },
+  ];
+  const db = pendingDb({ master: withName('Aalst (ABB)'), requests: [requestRow(5, 'ingediend', YESTERDAY)], storedVersions: storedVersion(5, { keys }) });
+  const { document } = await service(db).create(sessions.orgA, rename('Aalst (Y)', 'Aalst (ABB)'));
+  assert.equal(document.attributes.status, 'goedgekeurd');
+  assert.deepEqual(document.attributes.superseded, [], 'withdrawing it would drop the legal name nobody decided on again');
+  assert.deepEqual(document.attributes.competing.map((key) => key['competing-requests']), [[RID(5)]]);
+});
+
+test('an older request that changes a list keeps waiting: lists merge, so a newer change of the same list does not replace it', async () => {
+  const altLabel = `${NS.skos}altLabel`;
+  const db = pendingDb({
+    requests: [requestRow(5, 'ingediend', YESTERDAY)],
+    storedVersions: storedVersion(5, { keys: [{ predicate: altLabel, proposed: [literal('Oud Aalst')], base: [] }] }),
+  });
+  const ops = [{ op: 'update', data: { type: 'administrative-units', id: IDS.org, attributes: { 'alternative-name': ['Aalst-Centrum'] }, meta: { base: { attributes: { 'alternative-name': [] } } } } }];
+  const { document } = await service(db).create(sessions.orgA, body(IDS.org, 'organization-core-data', ops));
+  assert.equal(document.attributes.status, 'goedgekeurd');
+  assert.deepEqual(document.attributes.superseded, []);
+  assert.ok(db.queries.some((q) => q.includes('SELECT DISTINCT ?request ?uuid ?created') && q.includes(REQUEST(5))), 'it was considered');
+  assert.ok(!db.updates.some((q) => q.includes(`<${STEP_TYPE.intrekking}>`)), 'and kept');
+});
+
+test('ABB approving a newer pending request withdraws the older one of the same organisation; approving the older one leaves the newer waiting', async () => {
+  const twoPending = () =>
+    fakeDb({
+      requests: [requestRow(5, 'ingediend', YESTERDAY), requestRow(6, 'ingediend', { created: '2026-11-02T10:00:00Z' })],
+      steps: [stepRow(5, 1, 'indiening', 'ingediend'), stepRow(6, 1, 'indiening', 'ingediend')],
+      storedVersions: [...storedRename(5, 'Aalst (A)'), ...storedRename(6, 'Aalst (A2)')],
+      onUpdate: recordSteps,
+    });
+  const newer = twoPending();
+  const approved = await service(newer).addStep(sessions.abb, RID(6), step('goedkeuring'));
+  assert.equal(approved.document.attributes.status, 'goedgekeurd');
+  assert.deepEqual(approved.document.attributes.superseded, [RID(5)]);
+  assert.equal(newer.state.requests.find((r) => r.uuid === RID(5)).status, STATUS.ingetrokken);
+
+  const older = twoPending();
+  const first = await service(older).addStep(sessions.abb, RID(5), step('goedkeuring'));
+  assert.equal(first.document.attributes.status, 'goedgekeurd');
+  assert.deepEqual(first.document.attributes.superseded, [], 'an older request never withdraws a newer one');
+  assert.equal(older.state.requests.find((r) => r.uuid === RID(6)).status, STATUS.ingediend);
+});
+
+test('a failure while withdrawing does not undo the apply: the newer request is applied and the older one keeps waiting', async () => {
+  const db = pendingDb({
+    master: withName('Aalst (ABB)'),
+    requests: [requestRow(5, 'ingediend', YESTERDAY)],
+    onUpdate: (q) => {
+      if (q.includes(`<${STEP_TYPE.intrekking}>`)) throw new Error('Virtuoso said no');
+    },
+  });
+  const { document } = await service(db).create(sessions.orgA, rename('Aalst (Y)', 'Aalst (ABB)'));
+  assert.equal(document.attributes.status, 'goedgekeurd');
+  assert.deepEqual(document.attributes.superseded, []);
+});
+
+test('a result that would reach the row limit of the triplestore is queried in smaller batches instead of read cut off', async () => {
+  const asked = [];
+  const db = {
+    async query(q) {
+      asked.push(q);
+      return { results: { bindings: q.split(',').flatMap((item) => Array.from({ length: Number(item) }, () => ({ v: { value: item } }))) } };
+    },
+  };
+  const result = await selectInBatches(db, ['3', '4', '2'], (batch) => batch.join(','), { size: 3, maxRows: 6 });
+  assert.equal(result.results.bindings.length, 9);
+  assert.deepEqual(asked, ['3,4,2', '3,4', '3', '4', '2'], 'a batch of 9 rows reaches 6: split until each part stays under');
+  await assert.rejects(() => selectInBatches(db, ['7'], (batch) => batch.join(','), { maxRows: 6 }), /row limit of the triplestore/);
 });
 
 test('the fixture request is the kerngegevens page: six operations', () => {

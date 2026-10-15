@@ -22,6 +22,9 @@ export const uuidSequence = () => {
   return () => `00000000-0000-4000-8000-${String(++n).padStart(12, '0')}`;
 };
 export const sequenceUuid = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+/** A uuid (v4 format) for stored test data: testUuid('request', 5), testUuid('step', 51), ... */
+const TEST_UUID_PREFIX = { request: 'aaaaaaaa', step: 'bbbbbbbb', version: 'cccccccc', state: 'dddddddd', link: 'eeeeeeee', error: 'ffffffff' };
+export const testUuid = (kind, n) => `${TEST_UUID_PREFIX[kind]}-0000-4000-8000-${String(n).padStart(12, '0')}`;
 
 export const NOW = new Date('2026-11-03T10:12:00Z');
 export const APPLIED_AT = new Date('2026-11-03T10:12:01Z');
@@ -41,7 +44,11 @@ export const NS = {
   lblodgeneriek: 'https://data.lblod.info/vocabularies/generiek/',
   ere: 'http://data.lblod.info/vocabularies/erediensten/',
   dct: 'http://purl.org/dc/terms/',
+  pav: 'http://purl.org/pav/',
   foaf: 'http://xmlns.com/foaf/0.1/',
+  task: 'http://redpencil.data.gift/vocabularies/tasks/',
+  oslc: 'http://open-services.net/ns/core#',
+  as: 'https://www.w3.org/ns/activitystreams#',
   code: 'http://lblod.data.gift/vocabularies/organisatie/',
   mu: 'http://mu.semte.ch/vocabularies/core/',
   prov: 'http://www.w3.org/ns/prov#',
@@ -80,7 +87,12 @@ export const URIS = {
   siteB: `http://data.lblod.info/id/vestigingen/${IDS.siteB}`,
   addressB: `http://data.lblod.info/id/adressen/${IDS.addressB}`,
   account: 'http://data.lblod.info/id/account/5f1c2a3b-7d8e-4f90-a1b2-c3d4e5f60718',
+  accountB: 'http://data.lblod.info/id/account/7b3e4c5d-9f0a-4b12-c3d4-e5f60718293a',
   accountAbb: 'http://data.lblod.info/id/account/6a2d3b4c-8e9f-4a01-b2c3-d4e5f6071829',
+  // the persons of those accounts (foaf:account): who the service records
+  person: 'http://data.lblod.info/id/persoon/1e2f3a4b-5c6d-4e7f-8a9b-0c1d2e3f4a5b',
+  personB: 'http://data.lblod.info/id/persoon/2f3a4b5c-6d7e-4f8a-9b0c-1d2e3f4a5b6c',
+  personAbb: 'http://data.lblod.info/id/persoon/3a4b5c6d-7e8f-4a9b-8c1d-2e3f4a5b6c7d',
   gemeenteCode: `http://data.vlaanderen.be/id/concept/BestuurseenheidClassificatieCode/${IDS.gemeenteCode}`,
   siteType: `http://lblod.data.gift/concepts/${IDS.siteType}`,
   location: `http://data.lblod.info/id/werkingsgebieden/${IDS.location}`,
@@ -123,17 +135,94 @@ export const reachableByOrganisation = {
 export const reachable = reachableByOrganisation[URIS.org];
 export const target = organisations[IDS.org];
 
-/** What the masters currently hold for the relationships outside the aggregate (currentObjects). */
-export const masterObjects = {
-  [`${URIS.org} ${NS.org}classification`]: [URIS.gemeenteCode],
-  [`${URIS.org} ${NS.regorg}orgStatus`]: [URIS.statusCode],
-  [`${URIS.orgB} ${NS.org}classification`]: [URIS.gemeenteCode],
+/** SPARQL JSON bindings, as the triplestore answers them. */
+export const uri = (value) => ({ type: 'uri', value });
+export const literal = (value, language) => (language ? { type: 'literal', value, 'xml:lang': language } : { type: 'literal', value });
+export const typed = (value, datatype) => ({ type: 'typed-literal', value, datatype: datatype.startsWith('http') ? datatype : `${NS.xsd}${datatype}` });
+
+const masters = [URIS.org, URIS.orgB, URIS.abb, URIS.site, URIS.address, URIS.oldContact, URIS.kboIdentifier, URIS.structuredKbo, URIS.siteB, URIS.addressB];
+
+/**
+ * What the masters hold before the fixture request, as currentTerms answers it ("<s> <p>" ->
+ * bindings). Against it the request changes the house number, the full address and the address
+ * register link of the address, the contacts and the site type of the site, the name, the sites
+ * and the werkingsgebied of the organisation; it carries every other key as it is, so the
+ * structured identifier ends up changing nothing.
+ */
+export const masterState = () => ({
+  // every master exists: currentTerms answers (master, rdf:type) with its classes
+  ...Object.fromEntries(
+    [...resources.values()].filter((resource) => masters.includes(resource.uri)).map((resource) => [`${resource.uri} ${NS.rdf}type`, resource.classes.map(uri)]),
+  ),
+  [`${URIS.address} ${NS.locn}thoroughfare`]: [literal('Grote Markt')],
+  [`${URIS.address} ${NS.adres}Adresvoorstelling.huisnummer`]: [literal('1')],
+  [`${URIS.address} ${NS.locn}postCode`]: [literal('9300')],
+  [`${URIS.address} ${NS.adres}gemeentenaam`]: [literal('Aalst')],
+  [`${URIS.address} ${NS.locn}adminUnitL2`]: [literal('Oost-Vlaanderen')],
+  [`${URIS.address} ${NS.adres}land`]: [literal('België')],
+  [`${URIS.address} ${NS.locn}fullAddress`]: [literal('Grote Markt 1, 9300 Aalst, België')],
+  [`${URIS.address} ${NS.adres}verwijstNaar`]: [uri('https://data.vlaanderen.be/id/adres/123455')],
+  [`${URIS.site} ${NS.organisatie}bestaatUit`]: [uri(URIS.address)],
+  [`${URIS.site} ${NS.org}siteAddress`]: [uri(URIS.oldContact)],
+  [`${URIS.structuredKbo} ${NS.generiek}lokaleIdentificator`]: [literal('0207437468')],
+  [`${URIS.org} ${NS.skos}prefLabel`]: [literal('Aalst')],
+  [`${URIS.org} ${NS.skos}altLabel`]: [literal('Aalst')],
+  [`${URIS.org} ${NS.org}hasPrimarySite`]: [uri(URIS.site)],
+  [`${URIS.org} ${NS.org}hasSite`]: [uri(URIS.site)],
+  [`${URIS.org} ${NS.adms}identifier`]: [uri(URIS.kboIdentifier)],
+  [`${URIS.org} ${NS.besluit}werkingsgebied`]: [uri(URIS.location)],
+  [`${URIS.org} ${NS.org}classification`]: [uri(URIS.gemeenteCode)],
+  [`${URIS.org} ${NS.regorg}orgStatus`]: [uri(URIS.statusCode)],
+  [`${URIS.orgB} ${NS.skos}prefLabel`]: [literal('Gent')],
+  [`${URIS.orgB} ${NS.org}classification`]: [uri(URIS.gemeenteCode)],
+});
+
+/** A Map as currentTerms returns it, for the given state. */
+export const currentMap = (state = masterState()) => new Map(Object.entries(state));
+
+/**
+ * The records that link to a record in the given state: Map "<object> <predicate>" -> the SPARQL
+ * JSON bindings of the subjects, as incomingTerms returns it (every pair that has links).
+ */
+export const incomingMap = (state = masterState()) => {
+  const links = new Map();
+  for (const [pair, objects] of Object.entries(state)) {
+    const [subject, predicate] = pair.split(' ');
+    for (const object of objects) {
+      if (object.type !== 'uri') continue;
+      const key = `${object.value} ${predicate}`;
+      if (!links.has(key)) links.set(key, []);
+      links.get(key).push({ type: 'uri', value: subject });
+    }
+  }
+  return links;
 };
 
 export const sessions = {
-  orgA: { session: 'http://mu.semte.ch/sessions/a1', account: URIS.account, actor: { uri: URIS.org, uuid: IDS.org, classification: URIS.gemeenteCode } },
-  orgB: { session: 'http://mu.semte.ch/sessions/b1', account: URIS.account, actor: { uri: URIS.orgB, uuid: IDS.orgB, classification: URIS.gemeenteCode } },
-  abb: { session: 'http://mu.semte.ch/sessions/abb1', account: URIS.accountAbb, actor: { uri: URIS.abb, uuid: IDS.abb, classification: null } },
+  orgA: {
+    session: 'http://mu.semte.ch/sessions/a1',
+    account: URIS.account,
+    accountUuid: '5f1c2a3b-7d8e-4f90-a1b2-c3d4e5f60718',
+    person: URIS.person,
+    personUuid: '1e2f3a4b-5c6d-4e7f-8a9b-0c1d2e3f4a5b',
+    actor: { uri: URIS.org, uuid: IDS.org, classification: URIS.gemeenteCode },
+  },
+  orgB: {
+    session: 'http://mu.semte.ch/sessions/b1',
+    account: URIS.accountB,
+    accountUuid: '7b3e4c5d-9f0a-4b12-c3d4-e5f60718293a',
+    person: URIS.personB,
+    personUuid: '2f3a4b5c-6d7e-4f8a-9b0c-1d2e3f4a5b6c',
+    actor: { uri: URIS.orgB, uuid: IDS.orgB, classification: URIS.gemeenteCode },
+  },
+  abb: {
+    session: 'http://mu.semte.ch/sessions/abb1',
+    account: URIS.accountAbb,
+    accountUuid: '6a2d3b4c-8e9f-4a01-b2c3-d4e5f6071829',
+    person: URIS.personAbb,
+    personUuid: '3a4b5c6d-7e8f-4a9b-8c1d-2e3f4a5b6c7d',
+    actor: { uri: URIS.abb, uuid: IDS.abb, classification: null },
+  },
 };
 
 /**
@@ -180,6 +269,8 @@ export const operations = [
         contacts: { data: [{ type: 'contact-points', lid: 'c1' }] },
         'site-type': { data: { type: 'site-types', id: IDS.siteType } },
       },
+      // the contacts as the page loaded them
+      meta: { base: { relationships: { contacts: { data: [{ type: 'contact-points', id: IDS.oldContact }] } } } },
     },
   },
   {
@@ -213,6 +304,8 @@ export const operations = [
         // inverse: the other record's state, ignored
         memberships: { data: [] },
       },
+      // the name as the page loaded it
+      meta: { base: { attributes: { name: 'Aalst' } } },
     },
   },
   { op: 'delete', data: { type: 'contact-points', id: IDS.oldContact } },
