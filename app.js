@@ -1,0 +1,99 @@
+import { app, query, update } from 'mu';
+import bodyParser from 'body-parser';
+import { MODEL_DIR, CONFIG_FILE, APPLICATION_GRAPH, CHANGE_REQUESTS_GRAPH } from './constants.js';
+import { loadModel } from './lib/model.js';
+import { loadConfig } from './lib/config.js';
+import { createService } from './lib/change-requests.js';
+import { requireSession } from './lib/session.js';
+import { HttpError } from './lib/errors.js';
+
+// The template's query/update forward the user's session and send DEFAULT_MU_AUTH_SCOPE;
+// sparql-parser decides what that scope may read and write. No sudo anywhere.
+const db = { query, update };
+
+const model = loadModel(MODEL_DIR);
+const config = loadConfig(CONFIG_FILE, model);
+const service = createService({ model, config, db });
+
+// The template parses application/vnd.api+json bodies up to MAX_BODY_SIZE before any route
+// runs (its server.js), so that variable is the one limit; the Dockerfile sets it to 5mb. The
+// route below parses application/json, which the template leaves alone, with the same limit.
+const bodyLimit = process.env.MAX_BODY_SIZE || '100kb';
+
+console.log(
+  `change-request-service: ${model.names().length} resource types from ${MODEL_DIR}; ` +
+    `aggregates ${Object.keys(config.aggregates).join(', ')}; ` +
+    `graphs ${APPLICATION_GRAPH} and ${CHANGE_REQUESTS_GRAPH}; ` +
+    `scope ${process.env.DEFAULT_MU_AUTH_SCOPE || '(none: set DEFAULT_MU_AUTH_SCOPE)'}; body limit ${bodyLimit}`,
+);
+
+// Before /change-requests/:id, or "permissions" would be taken for an id.
+app.get('/change-requests/permissions', async (req, res, next) => {
+  try {
+    const session = await requireSession(db, req);
+    const target = req.query.target;
+    if (typeof target !== 'string' || !target) {
+      throw new HttpError(400, 'Missing target', { detail: 'Pass the uuid of the organisation as ?target=' });
+    }
+    res.status(200).json(await service.permissions(session, target));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/change-requests', async (req, res, next) => {
+  try {
+    const session = await requireSession(db, req);
+    const target = req.query.filter?.target;
+    res.status(200).json({ data: await service.list(session, typeof target === 'string' ? target : undefined) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/change-requests/:id', async (req, res, next) => {
+  try {
+    const session = await requireSession(db, req);
+    res.status(200).json({ data: await service.get(session, req.params.id) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/change-requests', bodyParser.json({ type: 'application/json', limit: bodyLimit }), async (req, res, next) => {
+  try {
+    const session = await requireSession(db, req);
+    const { status, document } = await service.create(session, req.body);
+    res.status(status).json({ data: document });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Applies the stored versions of a failed request (status mislukt) again.
+app.post('/change-requests/:id/apply', async (req, res, next) => {
+  try {
+    const session = await requireSession(db, req);
+    const { status, document } = await service.apply(session, req.params.id);
+    res.status(status).json({ data: document });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// JSON:API error documents; unexpected errors are logged and answered with a 500.
+app.use((error, _req, res, _next) => {
+  if (error instanceof HttpError) {
+    res.status(error.status).json({ errors: [error.toJSON()] });
+  } else if (error?.type === 'entity.too.large') {
+    // body-parser, the template's as well as the route's
+    res.status(413).json({ errors: [{ status: '413', title: 'Request body too large', detail: `The body exceeds MAX_BODY_SIZE (${bodyLimit})` }] });
+  } else if (error?.type === 'entity.parse.failed') {
+    res.status(400).json({ errors: [{ status: '400', title: 'Malformed JSON', detail: error.message }] });
+  } else if (typeof error?.status === 'number' && error.status >= 400 && error.status < 500) {
+    res.status(error.status).json({ errors: [{ status: String(error.status), title: error.message }] });
+  } else {
+    console.error(error);
+    res.status(500).json({ errors: [{ status: '500', title: 'Internal server error' }] });
+  }
+});
