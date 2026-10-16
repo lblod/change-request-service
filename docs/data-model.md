@@ -200,3 +200,438 @@ an older request a newer one replaced:
 
 <http://data.lblod.info/id/change-requests/5e97…> dct:isReplacedBy <http://data.lblod.info/id/change-requests/f6c3…> .
 ```
+
+## Example queries
+
+Run these against Virtuoso itself (in the app-rvs development stack: `http://localhost:8899/sparql`,
+the form or `curl --data-urlencode query@file.rq`). Through the stack the change-requests graph is
+not readable: only the service's scope has it, by design. Each query carries its own prefixes and
+`FROM` lines, so it can be pasted as it is; replace `<request uuid>` and `<record uuid>` where they
+appear. Labels (statuses, step types, organisations) come from the public graph, the data from the
+change-requests graph. All of them pass the conductor's "strict checking of void variables".
+
+### All requests, newest first
+
+Add `FILTER(?targetName = "Aalst")` or `?request adms:status/skos:prefLabel "Ingediend"` to narrow.
+
+```sparql
+PREFIX cr:   <http://lblod.data.gift/vocabularies/change-requests/>
+PREFIX mu:   <http://mu.semte.ch/vocabularies/core/>
+PREFIX dct:  <http://purl.org/dc/terms/>
+PREFIX adms: <http://www.w3.org/ns/adms#>
+PREFIX pav:  <http://purl.org/pav/>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+
+SELECT ?uuid ?created ?status ?aggregate ?targetName ?requesterName ?person ?replacedBy
+FROM <http://mu.semte.ch/graphs/change-requests>
+FROM <http://mu.semte.ch/graphs/public>
+WHERE {
+  ?request a cr:ChangeRequest ;
+    mu:uuid ?uuid ;
+    dct:created ?created ;
+    adms:status/skos:prefLabel ?status ;
+    cr:aggregate ?aggregate ;
+    cr:target/skos:prefLabel ?targetName ;
+    pav:createdBy/skos:prefLabel ?requesterName ;
+    dct:creator ?creator .
+  OPTIONAL { ?creator foaf:firstName ?first ; foaf:familyName ?last }
+  OPTIONAL { ?request dct:isReplacedBy/mu:uuid ?replacedBy }
+  BIND(COALESCE(CONCAT(?first, " ", ?last), STR(?creator)) AS ?person)
+}
+ORDER BY DESC(?created)
+```
+
+### The steps of one request
+
+Who did what, when, under which rule. The service shows as its URI.
+
+```sparql
+PREFIX cr:     <http://lblod.data.gift/vocabularies/change-requests/>
+PREFIX mu:     <http://mu.semte.ch/vocabularies/core/>
+PREFIX dct:    <http://purl.org/dc/terms/>
+PREFIX adms:   <http://www.w3.org/ns/adms#>
+PREFIX prov:   <http://www.w3.org/ns/prov#>
+PREFIX schema: <http://schema.org/>
+PREFIX skos:   <http://www.w3.org/2004/02/skos/core#>
+PREFIX foaf:   <http://xmlns.com/foaf/0.1/>
+PREFIX task:   <http://redpencil.data.gift/vocabularies/tasks/>
+PREFIX oslc:   <http://open-services.net/ns/core#>
+
+SELECT ?position ?type ?status ?at ?agent ?actingOrg ?rule ?reason ?error
+FROM <http://mu.semte.ch/graphs/change-requests>
+FROM <http://mu.semte.ch/graphs/public>
+WHERE {
+  ?request a cr:ChangeRequest ; mu:uuid "<request uuid>" .
+  ?step a cr:Action ;
+    dct:isPartOf ?request ;
+    schema:position ?position ;
+    dct:type/skos:prefLabel ?type ;
+    adms:status/skos:prefLabel ?status ;
+    prov:startedAtTime ?at ;
+    prov:wasAssociatedWith ?agentUri .
+  OPTIONAL { ?agentUri foaf:familyName ?agentName }
+  OPTIONAL { ?step cr:actingOrganisation/skos:prefLabel ?actingOrg }
+  OPTIONAL { ?step cr:rule ?rule }
+  OPTIONAL { ?step dct:description ?reason }
+  OPTIONAL { ?step task:error/oslc:message ?error }
+  BIND(COALESCE(?agentName, STR(?agentUri)) AS ?agent)
+}
+ORDER BY ?position
+```
+
+### What one request proposes
+
+One row per record and field: the value the form started from (`base`) and the proposed one. An
+update or delete lists every field it changes (a cleared field has no `proposed`); a create lists
+every value of the new record.
+
+```sparql
+PREFIX cr:   <http://lblod.data.gift/vocabularies/change-requests/>
+PREFIX mu:   <http://mu.semte.ch/vocabularies/core/>
+PREFIX dct:  <http://purl.org/dc/terms/>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX as:   <https://www.w3.org/ns/activitystreams#>
+PREFIX rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+
+SELECT ?record ?recordType ?operation ?property ?base ?proposed
+FROM <http://mu.semte.ch/graphs/change-requests>
+WHERE {
+  ?request a cr:ChangeRequest ; mu:uuid "<request uuid>" .
+  ?submission a cr:Action ; dct:isPartOf ?request ; prov:generated ?version .
+  ?version dct:isVersionOf ?record ; cr:resourceType ?recordType ; cr:operation ?operation .
+  {
+    ?version cr:changesProperty ?property .
+    OPTIONAL { ?version cr:base ?baseState . ?baseState ?property ?base }
+    OPTIONAL { ?version ?property ?proposed }
+  }
+  UNION
+  {
+    ?version cr:operation as:Create ; ?property ?proposed .
+    FILTER(?property NOT IN (rdf:type, mu:uuid, dct:isVersionOf, cr:masterUuid,
+                             prov:generatedAtTime, cr:resourceType, cr:operation))
+  }
+}
+ORDER BY ?record ?property
+```
+
+### What an apply changed: old and new
+
+The applying step (`prov:invalidated`) holds what the record held at that moment, the version what
+replaced it. A list field shows whole lists on both sides; the apply merged them.
+
+```sparql
+PREFIX cr:   <http://lblod.data.gift/vocabularies/change-requests/>
+PREFIX mu:   <http://mu.semte.ch/vocabularies/core/>
+PREFIX dct:  <http://purl.org/dc/terms/>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+
+SELECT ?stepType ?appliedAt ?record ?property ?old ?new
+FROM <http://mu.semte.ch/graphs/change-requests>
+FROM <http://mu.semte.ch/graphs/public>
+WHERE {
+  ?request a cr:ChangeRequest ; mu:uuid "<request uuid>" .
+  ?apply a cr:Action ; dct:isPartOf ?request ;
+    dct:type/skos:prefLabel ?stepType ;
+    prov:startedAtTime ?appliedAt ;
+    prov:invalidated ?state .
+  ?state dct:isVersionOf ?record .
+  ?submission a cr:Action ; dct:isPartOf ?request ; prov:generated ?version .
+  ?version dct:isVersionOf ?record ; cr:changesProperty ?property .
+  OPTIONAL { ?state ?property ?old }
+  OPTIONAL { ?version ?property ?new }
+}
+ORDER BY ?record ?property
+```
+
+### The pending requests, with the live picture
+
+Every request that waits for ABB, per field: its base, its proposal and what the record holds now.
+A single-valued field is in conflict where `current` differs from both `base` and `proposed`. This
+is what the service computes on every `GET`; it is not stored.
+
+```sparql
+PREFIX cr:   <http://lblod.data.gift/vocabularies/change-requests/>
+PREFIX mu:   <http://mu.semte.ch/vocabularies/core/>
+PREFIX dct:  <http://purl.org/dc/terms/>
+PREFIX adms: <http://www.w3.org/ns/adms#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX pav:  <http://purl.org/pav/>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+
+SELECT ?uuid ?created ?requester ?record ?property ?base ?proposed ?current
+FROM <http://mu.semte.ch/graphs/change-requests>
+FROM <http://mu.semte.ch/graphs/public>
+WHERE {
+  ?request a cr:ChangeRequest ;
+    mu:uuid ?uuid ;
+    dct:created ?created ;
+    adms:status/skos:prefLabel "Ingediend" ;
+    pav:createdBy/skos:prefLabel ?requester .
+  ?submission a cr:Action ; dct:isPartOf ?request ; prov:generated ?version .
+  ?version dct:isVersionOf ?record ; cr:changesProperty ?property .
+  OPTIONAL { ?version cr:base ?baseState . ?baseState ?property ?base }
+  OPTIONAL { ?version ?property ?proposed }
+  OPTIONAL { ?record ?property ?current }
+}
+ORDER BY ?created ?record ?property
+```
+
+### The whole history of one record
+
+Every proposal, every base state and every state an apply replaced, also after the record was
+deleted (hence `cr:masterUuid`, not the record's `mu:uuid`).
+
+```sparql
+PREFIX cr:   <http://lblod.data.gift/vocabularies/change-requests/>
+PREFIX mu:   <http://mu.semte.ch/vocabularies/core/>
+PREFIX dct:  <http://purl.org/dc/terms/>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+
+SELECT ?when ?kind ?requestUuid ?property ?value
+FROM <http://mu.semte.ch/graphs/change-requests>
+WHERE {
+  ?version cr:masterUuid "<record uuid>" ; dct:isVersionOf ?record .
+  ?submission prov:generated ?version ; dct:isPartOf ?request .
+  ?request mu:uuid ?requestUuid .
+  {
+    VALUES ?kind { "proposed" }
+    ?version prov:generatedAtTime ?when ; ?property ?value .
+    FILTER(?property NOT IN (rdf:type, mu:uuid, dct:isVersionOf, cr:masterUuid, prov:generatedAtTime,
+                             cr:resourceType, cr:operation, cr:changesProperty, cr:base))
+  }
+  UNION
+  {
+    VALUES ?kind { "base: what the form showed" }
+    ?version prov:generatedAtTime ?when ; cr:base ?state .
+    ?state ?property ?value .
+    FILTER(?property NOT IN (rdf:type, mu:uuid, dct:isVersionOf, cr:incomingLink))
+  }
+  UNION
+  {
+    VALUES ?kind { "replaced by the apply" }
+    ?apply dct:isPartOf ?request ; prov:invalidated ?state ; prov:startedAtTime ?when .
+    ?state dct:isVersionOf ?record ; ?property ?value .
+    FILTER(?property NOT IN (rdf:type, mu:uuid, dct:isVersionOf, cr:incomingLink))
+  }
+}
+ORDER BY ?when ?kind ?property
+```
+
+### Deleted records and who pointed at them
+
+The links as they were when the delete was submitted (the `rdf:Statement`s on its base state).
+
+```sparql
+PREFIX cr:   <http://lblod.data.gift/vocabularies/change-requests/>
+PREFIX mu:   <http://mu.semte.ch/vocabularies/core/>
+PREFIX dct:  <http://purl.org/dc/terms/>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX as:   <https://www.w3.org/ns/activitystreams#>
+PREFIX rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+
+SELECT ?requestUuid ?record ?recordType ?linkingRecord ?predicate
+FROM <http://mu.semte.ch/graphs/change-requests>
+WHERE {
+  ?request mu:uuid ?requestUuid .
+  ?submission dct:isPartOf ?request ; prov:generated ?version .
+  ?version cr:operation as:Delete ; dct:isVersionOf ?record ; cr:resourceType ?recordType ; cr:base ?state .
+  ?state cr:incomingLink ?link .
+  ?link a rdf:Statement ; rdf:subject ?linkingRecord ; rdf:predicate ?predicate .
+}
+```
+
+### Failed applies
+
+```sparql
+PREFIX cr:   <http://lblod.data.gift/vocabularies/change-requests/>
+PREFIX mu:   <http://mu.semte.ch/vocabularies/core/>
+PREFIX dct:  <http://purl.org/dc/terms/>
+PREFIX prov: <http://www.w3.org/ns/prov#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX task: <http://redpencil.data.gift/vocabularies/tasks/>
+PREFIX oslc: <http://open-services.net/ns/core#>
+
+SELECT ?requestUuid ?stepType ?at ?message
+FROM <http://mu.semte.ch/graphs/change-requests>
+FROM <http://mu.semte.ch/graphs/public>
+WHERE {
+  ?step a cr:Action ; dct:isPartOf ?request ; dct:type/skos:prefLabel ?stepType ;
+    prov:startedAtTime ?at ; task:error ?error .
+  ?request mu:uuid ?requestUuid .
+  ?error a oslc:Error ; oslc:message ?message .
+}
+ORDER BY DESC(?at)
+```
+
+### Requests per status
+
+```sparql
+PREFIX cr:   <http://lblod.data.gift/vocabularies/change-requests/>
+PREFIX adms: <http://www.w3.org/ns/adms#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+
+SELECT ?status (COUNT(?request) AS ?requests)
+FROM <http://mu.semte.ch/graphs/change-requests>
+FROM <http://mu.semte.ch/graphs/public>
+WHERE { ?request a cr:ChangeRequest ; adms:status/skos:prefLabel ?status }
+GROUP BY ?status
+```
+
+### Everything at once
+
+One row per request × step × record × field (plus one per kept link). The step columns are filled
+on every row; the record and field columns only on indiening rows (proposal with its base) and on
+apply rows (old value in `replaced`, new in `proposed`, so an apply row reads as a diff). A step
+without data (afkeuring, intrekking) gives one row with empty record columns. Uncomment the
+`VALUES` line for one request; over a whole graph, page with `LIMIT`/`OFFSET` (Virtuoso cuts at
+10 000 rows without a warning). Its shape follows the Virtuoso rules below.
+
+```sparql
+PREFIX cr:     <http://lblod.data.gift/vocabularies/change-requests/>
+PREFIX mu:     <http://mu.semte.ch/vocabularies/core/>
+PREFIX dct:    <http://purl.org/dc/terms/>
+PREFIX adms:   <http://www.w3.org/ns/adms#>
+PREFIX prov:   <http://www.w3.org/ns/prov#>
+PREFIX pav:    <http://purl.org/pav/>
+PREFIX schema: <http://schema.org/>
+PREFIX skos:   <http://www.w3.org/2004/02/skos/core#>
+PREFIX foaf:   <http://xmlns.com/foaf/0.1/>
+PREFIX task:   <http://redpencil.data.gift/vocabularies/tasks/>
+PREFIX oslc:   <http://open-services.net/ns/core#>
+PREFIX as:     <https://www.w3.org/ns/activitystreams#>
+PREFIX rdf:    <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+
+SELECT ?requestUuid ?created ?requestStatus ?aggregate ?target ?requester ?submitter ?replacedBy
+       ?position ?stepType ?stepStatus ?at ?who ?actingOrg ?rule ?reason ?errorAt ?errorMessage
+       ?recordType ?recordUuid ?record ?operation ?property
+       ?base ?baseLabel ?proposed ?proposedLabel ?replaced ?replacedLabel
+       ?linkFrom ?linkPredicate
+FROM <http://mu.semte.ch/graphs/change-requests>
+FROM <http://mu.semte.ch/graphs/public>
+WHERE {
+  # VALUES ?requestUuid { "<request uuid>" }        # one request instead of all
+
+  # --- the request --------------------------------------------------------------------------
+  ?request a cr:ChangeRequest ;
+    mu:uuid ?requestUuid ;
+    dct:created ?created ;
+    adms:status ?requestStatusConcept ;
+    cr:aggregate ?aggregate ;
+    cr:target ?targetUri ;
+    pav:createdBy ?requesterUri ;
+    dct:creator ?creator .
+  OPTIONAL { ?requestStatusConcept skos:prefLabel ?requestStatus }
+  OPTIONAL { ?targetUri skos:prefLabel ?target }
+  OPTIONAL { ?requesterUri skos:prefLabel ?requester }
+  OPTIONAL { ?creator foaf:firstName ?creatorFirst ; foaf:familyName ?creatorLast }
+  OPTIONAL { ?request dct:isReplacedBy/mu:uuid ?replacedBy }
+  BIND(COALESCE(CONCAT(?creatorFirst, " ", ?creatorLast), STR(?creator)) AS ?submitter)
+
+  # --- its steps ----------------------------------------------------------------------------
+  OPTIONAL {
+    ?step a cr:Action ;
+      dct:isPartOf ?request ;
+      schema:position ?position ;
+      dct:type ?stepTypeConcept ;
+      adms:status ?stepStatusConcept ;
+      prov:startedAtTime ?at ;
+      prov:wasAssociatedWith ?agent .
+    OPTIONAL { ?stepTypeConcept skos:prefLabel ?stepType }
+    OPTIONAL { ?stepStatusConcept skos:prefLabel ?stepStatus }
+    OPTIONAL { ?agent foaf:firstName ?agentFirst ; foaf:familyName ?agentLast }
+    OPTIONAL { ?step cr:actingOrganisation/skos:prefLabel ?actingOrg }
+    OPTIONAL { ?step cr:rule ?rule }
+    OPTIONAL { ?step dct:description ?reason }
+    OPTIONAL { ?step task:error ?error . ?error oslc:message ?errorMessage ; dct:created ?errorAt }
+    BIND(COALESCE(CONCAT(?agentFirst, " ", ?agentLast), STR(?agent)) AS ?who)   # the service: its URI
+
+    # --- the fields a step touched: one UNION, every branch walks the path from ?step -----------
+    OPTIONAL {
+      { # an indiening: a field a version changes, with the base the form showed
+        ?step prov:generated ?version .
+        ?version dct:isVersionOf ?record ;
+          cr:masterUuid ?recordUuid ;
+          cr:resourceType ?recordType ;
+          cr:operation ?operation ;
+          cr:changesProperty ?property .
+        OPTIONAL { ?version ?property ?proposed . OPTIONAL { ?proposed skos:prefLabel ?proposedLabel } }   # empty: the field is cleared
+        OPTIONAL { ?version cr:base ?baseState . ?baseState ?property ?base . OPTIONAL { ?base skos:prefLabel ?baseLabel } } }
+      UNION
+      { # an indiening: a value of a record a version creates
+        ?step prov:generated ?version .
+        ?version dct:isVersionOf ?record ;
+          cr:masterUuid ?recordUuid ;
+          cr:resourceType ?recordType ;
+          cr:operation ?operation ;
+          cr:operation as:Create ;
+          ?property ?proposed .
+        FILTER(?property NOT IN (rdf:type, mu:uuid, dct:isVersionOf, cr:masterUuid,
+                                 prov:generatedAtTime, cr:resourceType, cr:operation))
+        OPTIONAL { ?proposed skos:prefLabel ?proposedLabel } }
+      UNION
+      { # an indiening: a link that pointed at a record a version deletes
+        ?step prov:generated ?version .
+        ?version dct:isVersionOf ?record ;
+          cr:masterUuid ?recordUuid ;
+          cr:resourceType ?recordType ;
+          cr:operation ?operation ;
+          cr:base ?baseState .
+        ?baseState cr:incomingLink ?link .
+        ?link rdf:subject ?linkFrom ; rdf:predicate ?linkPredicate .
+        VALUES ?property { cr:incomingLink } }
+      UNION
+      { # an apply (goedkeuring, hertoepassing, also a mislukt attempt): a field of a state it replaced,
+        # next to the value the request put there
+        ?step prov:invalidated ?state .
+        ?state dct:isVersionOf ?record .
+        ?step dct:isPartOf ?sameRequest . ?submission dct:isPartOf ?sameRequest ; prov:generated ?version .
+        ?version dct:isVersionOf ?record ;
+          cr:masterUuid ?recordUuid ;
+          cr:resourceType ?recordType ;
+          cr:operation ?operation ;
+          cr:changesProperty ?property .
+        OPTIONAL { ?state ?property ?replaced . OPTIONAL { ?replaced skos:prefLabel ?replacedLabel } }   # empty: the field was empty before
+        OPTIONAL { ?version ?property ?proposed . OPTIONAL { ?proposed skos:prefLabel ?proposedLabel } } }
+      UNION
+      { # an apply: a link a delete removed
+        ?step prov:invalidated ?state .
+        ?state dct:isVersionOf ?record ;
+          cr:incomingLink ?link .
+        ?link rdf:subject ?linkFrom ; rdf:predicate ?linkPredicate .
+        ?step dct:isPartOf ?sameRequest . ?submission dct:isPartOf ?sameRequest ; prov:generated ?version .
+        ?version dct:isVersionOf ?record ;
+          cr:masterUuid ?recordUuid ;
+          cr:resourceType ?recordType ;
+          cr:operation ?operation .
+        VALUES ?property { cr:incomingLink } }
+    }
+  }
+}
+ORDER BY DESC(?created) ?requestUuid ?position ?recordType ?record ?property
+```
+
+### Virtuoso rules for report queries on this graph
+
+Found by bisection on Virtuoso 7.20 (redpencil/virtuoso 1.4.0), each checked against ground-truth
+counts of the rows a shape must return. Reproduce the conductor's behaviour over HTTP by prepending
+`define sql:signal-void-variables 1` to the query.
+
+- **`VALUES`, not `BIND`, for a constant inside a `UNION` branch** when the query has two `FROM`
+  graphs: the conductor's strict checking rejects the `BIND` ("Variable `_::default_…` is used in
+  subexpressions of the query but not assigned"). The same goes for `BIND(?a AS ?b)` when another
+  branch does not bind `?a`: bind `?b` by a pattern in every branch instead.
+- **Look a label up where the value is bound.** `OPTIONAL { ?x skos:prefLabel ?l }` at the top
+  level, on a variable bound deep inside `OPTIONAL { UNION { OPTIONAL } }`, sends the cost estimate
+  past the limit ("estimated execution time exceeds 400 s") while the real run takes under a
+  second. Nest the lookup inside the `OPTIONAL` that binds the value.
+- **No `{ SELECT * WHERE { … } }` around the nested part** to keep the labels outside: Virtuoso
+  then silently drops values bound in nested `OPTIONAL`s and `UNION` branches (here 116 of 152
+  create values). An explicit projection list does not help.
+- **One `UNION`, every branch walking the whole path from the anchor.** A nested `OPTIONAL` in a
+  branch does not see a variable bound outside the branch (the rows where the field was empty
+  before vanish); two sibling `OPTIONAL`s that bind the same variables lose the bindings the second
+  one makes; and naming a variable from two groups further out (`?request`) makes Virtuoso re-run
+  the branch per row (0.5 s became 25 s), hence the local `?sameRequest`.

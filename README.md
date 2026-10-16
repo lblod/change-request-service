@@ -172,7 +172,8 @@ flowchart LR
 - The change-requests graph is not exported (no deltas, no LDES): a version is a proposal, not the
   state of a record.
 
-A full Turtle example is in [docs/data-model.md](docs/data-model.md).
+A full Turtle example and ready-to-paste SPARQL queries (one request, its diff, a record's
+history, ABB's queue, everything at once) are in [docs/data-model.md](docs/data-model.md).
 
 ## Authorization
 
