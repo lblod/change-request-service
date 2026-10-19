@@ -79,7 +79,7 @@ the application graph.
 The statuses (ingediend, goedgekeurd, afgekeurd, ingetrokken, mislukt) and the step types
 (indiening, goedkeuring, afkeuring, intrekking, hertoepassing, wijziging) are `skos:Concept`s with
 UUID URIs under `http://lblod.data.gift/concepts/`, in two schemes under
-`http://lblod.data.gift/concept-schemes/`. app-rvs loads them with a migration; the service knows
+`http://lblod.data.gift/concept-schemes/`. app-lokale-verkenner loads them with a migration; the service knows
 their URIs (`constants.js`).
 
 ## Example
@@ -203,7 +203,7 @@ an older request a newer one replaced:
 
 ## Example queries
 
-Run these against Virtuoso itself (in the app-rvs development stack: `http://localhost:8899/sparql`,
+Run these against Virtuoso itself (in the app-lokale-verkenner development stack: `http://localhost:8899/sparql`,
 the form or `curl --data-urlencode query@file.rq`). Through the stack the change-requests graph is
 not readable: only the service's scope has it, by design. Each query carries its own prefixes and
 `FROM` lines, so it can be pasted as it is; replace `<request uuid>` and `<record uuid>` where they

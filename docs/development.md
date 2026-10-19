@@ -1,6 +1,6 @@
 # Development
 
-## Running the service in app-rvs
+## Running the service in app-lokale-verkenner
 
 The configuration and the model are mounted side by side (`docker-compose.yml`):
 
@@ -22,8 +22,8 @@ match "/change-requests/*path", %{accept: [:json], layer: :api} do
 end
 ```
 
-- The template talks to `http://database:8890/sparql`, which is sparql-parser in app-rvs.
-- A model that loads only part of OP's files (app-rvs reads `domain.json` and `auth.json`) may
+- The template talks to `http://database:8890/sparql`, which is sparql-parser in app-lokale-verkenner.
+- A model that loads only part of OP's files (app-lokale-verkenner reads `domain.json` and `auth.json`) may
   hold relationships to types it does not define; the service logs them at start-up and leaves them
   out, as mu-cl-resources only fails when such a relationship is used.
 - A mounted checkout (`docker-compose.dev.yml`: `NODE_ENV: development`, sources at `/app`) does not
@@ -36,7 +36,7 @@ end
 ```sh
 npm run setup      # once: installs the template's node_modules and its `mu` helper locally (needs docker)
 npm test           # unit tests (node:test) against OP's model files
-MODEL_DIR=../app-rvs/config/resources npm test   # the same against app-rvs's files (domain.json and auth.json only)
+MODEL_DIR=../app-lokale-verkenner/config/resources npm test   # the same against app-lokale-verkenner's files (domain.json and auth.json only)
 npm run check      # node --check app.js
 ```
 
@@ -45,7 +45,7 @@ npm run check      # node --check app.js
 - `test/fixtures/*.sparql` are golden copies of the generated updates for a small
   organization-core-data request; `UPDATE_GOLDEN=1 npm test` rewrites them after an intended
   change. Review the diff.
-- `scripts/e2e-mock-login.sh` runs the whole flow against app-rvs as a browser would: through
+- `scripts/e2e-mock-login.sh` runs the whole flow against app-lokale-verkenner as a browser would: through
   mu-identifier, logged in with mock-login as two gemeenten and ABB. It covers the permissions, a
   rename and its steps, a refused cross-organisation request, refused direct and forged-scope
   writes, the paged listings, a stale form (a conflict that waits, a competing request, the same

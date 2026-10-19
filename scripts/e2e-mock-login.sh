@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# End-to-end check of change-request-service in app-rvs, as a browser would do it: through
+# End-to-end check of change-request-service in app-lokale-verkenner, as a browser would do it: through
 # mu-identifier, logged in with mock-login as two gemeenten and as ABB. Every change it makes is
 # put back at the end through change requests, and every request it leaves pending is closed (the
 # requests themselves stay, as history).
 #
-#   BASE_URL         the identifier (default http://localhost:88, app-rvs docker-compose.dev.yml)
+#   BASE_URL         the identifier (default http://localhost:88, app-lokale-verkenner docker-compose.dev.yml)
 #   SPARQL_ENDPOINT  Virtuoso, to look up accounts and check graphs (default http://localhost:8899/sparql)
 #   ORG_A_LABEL, ORG_B_LABEL  two gemeenten by name (default Aalst and Gent)
 set -u
@@ -115,7 +115,7 @@ check "permissions: ABB on B" "True abb-edits-all" "$(perm "$JABB" "$B_ORG")"
 check "permissions without login" 401 "$(code "$JANON" "/change-requests/permissions?target=$A_ORG")"
 
 # --- an auto-approved request and its steps ------------------------------------------------------
-NAME0="$A_NAME (test RVS)"
+NAME0="$A_NAME (test Lokale Verkenner)"
 check "A renames itself through a change request" 201 "$(rename "$JA" "$A_ORG" "$NAME0")"
 check "the request is applied at once" goedgekeurd "$(py "a['status']")"
 AUTO_ID=$(py "d['data']['id']")
@@ -147,7 +147,7 @@ check "the list is paged: page[size]=1 gives one request, meta.count counts them
 check "a page size above the maximum: 400" 400 "$(code "$JA" "/change-requests?page[size]=1000")"
 
 # --- a stale form: ABB renamed A after A's page loaded it -----------------------------------------
-ABB_NAME="$A_NAME (ABB, test RVS)"
+ABB_NAME="$A_NAME (ABB, test Lokale Verkenner)"
 check "ABB renames A" 201 "$(rename "$JABB" "$A_ORG" "$ABB_NAME")"
 check "ABB's rename is applied" goedgekeurd "$(py "a['status']")"
 
@@ -165,7 +165,7 @@ check "it waits too, and names the first pending request as competing" "ingedien
 check "ABB reads the first pending request" 200 "$(fetch "$JABB" "/change-requests/$P1")"
 check "its conflict is computed live and names the second as competing" "administrative-units name: base $NAME0, current $ABB_NAME, proposed $STALE, competing $P2" "$(py "conflicts(a['conflicts'])")"
 
-LEGAL="$A_NAME (legal name, test RVS)"
+LEGAL="$A_NAME (legal name, test Lokale Verkenner)"
 SAME_FORM=$(cr_body "$A_ORG" "[{\"op\":\"update\",\"data\":{\"type\":\"administrative-units\",\"id\":\"$A_ORG\",\"attributes\":{\"name\":\"$NAME0\",\"legal-name\":\"$LEGAL\"},\"meta\":{\"base\":{\"attributes\":{\"name\":\"$NAME0\",\"legal-name\":$A_LEGAL}}}}}]")
 check "the same stale form changes only the legal name (the old name carried unchanged)" 201 "$(post "$JA" /change-requests "$SAME_FORM")"
 check "it is applied: no conflict on a key the user did not change" "goedgekeurd []" "$(py "a['status'] + ' ' + json.dumps(a['conflicts'])")"
@@ -216,7 +216,7 @@ check "that state holds the name the approval overwrote" True "$(ask "GRAPH <htt
 check "the name is the approved one" "$OVERRIDE" "$(name_of "$JA" "$A_ORG")"
 
 # B: only ABB decides, also on B's own request
-check "B submits a rename of itself from a stale form" 201 "$(stale_rename "$JB" "$B_ORG" "$B_NAME (B, test RVS)" "$B_NAME (old)")"
+check "B submits a rename of itself from a stale form" 201 "$(stale_rename "$JB" "$B_ORG" "$B_NAME (B, test Lokale Verkenner)" "$B_NAME (old)")"
 PB=$(py "d['data']['id']"); PENDING+=("$PB")
 check "B's request waits" ingediend "$(py "a['status']")"
 check "B approves its own pending request: 403" 403 "$(take_step "$JB" "$PB" goedkeuring)"

@@ -1,5 +1,5 @@
 // Graph URIs, file locations and vocabularies the service uses. Everything here can be
-// overridden through the environment; the defaults match the plan for app-rvs.
+// overridden through the environment; the defaults match the plan for app-lokale-verkenner.
 
 export const APPLICATION_GRAPH =
   process.env.APPLICATION_GRAPH || process.env.MU_APPLICATION_GRAPH || 'http://mu.semte.ch/application';
@@ -23,7 +23,7 @@ export const LINK_BASE = 'http://data.lblod.info/id/record-links/';
 // oslc:Error: why an apply failed, in the shape job-controller and delta-consumer write theirs.
 export const ERROR_BASE = 'http://redpencil.data.gift/id/jobs/error/';
 
-// The two code lists (published as SKOS by app-rvs's migrations): the status of a request, and the
+// The two code lists (published as SKOS by app-lokale-verkenner's migrations): the status of a request, and the
 // type of its steps. "wijziging" (an edit of a pending request) is reserved: it has a concept but
 // the service does not take it yet.
 export const STATUS_SCHEME = 'http://lblod.data.gift/concept-schemes/e8274055-0834-4511-8b84-a2af41055633';
@@ -94,7 +94,7 @@ export const SERVICE_AGENT = 'http://lblod.data.gift/services/change-request-ser
 export const TARGET_TYPE = 'organizations';
 
 // The most rows the triplestore returns for one SELECT: Virtuoso's ResultSetMaxRows (10000 in
-// app-rvs's virtuoso.ini). Virtuoso cuts a larger result off without an error, so a result that
+// app-lokale-verkenner's virtuoso.ini). Virtuoso cuts a larger result off without an error, so a result that
 // reaches this many rows is taken as cut off: the service queries smaller batches instead.
 export const SPARQL_MAX_ROWS = Number.parseInt(process.env.SPARQL_MAX_ROWS, 10) || 10000;
 

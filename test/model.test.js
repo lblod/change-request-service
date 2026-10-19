@@ -8,7 +8,7 @@ import { loadModel, expandCurie } from '../lib/model.js';
 import { loadConfig } from '../lib/config.js';
 
 // The assertions hold for app-organization-portal's model files (the default MODEL_DIR) and for
-// a stack that loads only part of them, such as app-rvs (domain.json and auth.json): assertions on
+// a stack that loads only part of them, such as app-lokale-verkenner (domain.json and auth.json): assertions on
 // types from the other files (change-events.json, file.json, dcat.json) run only when those types
 // are in the model under test.
 const has = (...names) => names.every((name) => model.has(name));

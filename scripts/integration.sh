@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# End-to-end calls against a running app-rvs, or against this service on its own port.
+# End-to-end calls against a running app-lokale-verkenner, or against this service on its own port.
 #
 # Environment (required unless noted):
 #   BASE_URL        URL under which /change-requests is served AND where the mu-session-id header
 #                   is honoured: the service's own published port, or the dispatcher's port.
 #                   Not the identifier: it replaces mu-session-id with the session of the cookie.
 #   SESSION_ORG_A   session URI (the value of the mu-session-id header) of an account logged in
-#                   for organisation A, as the fixture sessions in the app-rvs README give them
+#                   for organisation A, as the fixture sessions in the app-lokale-verkenner README give them
 #   SESSION_ORG_B   idem for organisation B
 #   SESSION_ABB     idem for the ABB account (the organisation behind "abbUri" in the config)
 #   ORG_A_UUID      mu:uuid of organisation A (the ext:sessionGroup of SESSION_ORG_A)

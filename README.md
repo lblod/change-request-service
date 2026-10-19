@@ -1,6 +1,6 @@
 # change-request-service
 
-Every edit of organisation data in app-rvs is a **change request**. The frontend sends the new
+Every edit of organisation data in app-lokale-verkenner is a **change request**. The frontend sends the new
 state of a group of records. This service checks it, keeps it as history, and applies it to the
 organisation data: at once when that is safe, or after ABB approves it.
 
@@ -24,7 +24,7 @@ Detail lives in `docs/`: [API](docs/api.md), [what is stored](docs/data-model.md
 
 ```mermaid
 sequenceDiagram
-  participant F as frontend-rvs
+  participant F as frontend-lokale-verkenner
   participant S as change-request-service
   participant P as sparql-parser
   F->>S: POST /change-requests: new state of one aggregate, with the values the form started from
@@ -168,7 +168,7 @@ flowchart LR
   versions; a version never carries the record's `rdf:type`.
 - The old and the new value of every applied field follow from the state the apply replaced and
   the version; the conflicts an approval overrode are derived from them, not stored.
-- Statuses and step types are SKOS concepts with UUID URIs, loaded by an app-rvs migration.
+- Statuses and step types are SKOS concepts with UUID URIs, loaded by an app-lokale-verkenner migration.
 - The change-requests graph is not exported (no deltas, no LDES): a version is a proposal, not the
   state of a record.
 
@@ -203,7 +203,7 @@ The sparql-parser configuration and the facts it rests on are in
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `DEFAULT_MU_AUTH_SCOPE` | `http://services.lblod.info/change-request-service` | the scope sparql-parser grants the writes to |
-| `APPLICATION_GRAPH` | `MU_APPLICATION_GRAPH` or `http://mu.semte.ch/application` | the graph of the organisation data (`http://mu.semte.ch/graphs/public` in app-rvs) |
+| `APPLICATION_GRAPH` | `MU_APPLICATION_GRAPH` or `http://mu.semte.ch/application` | the graph of the organisation data (`http://mu.semte.ch/graphs/public` in app-lokale-verkenner) |
 | `CHANGE_REQUESTS_GRAPH` | `http://mu.semte.ch/graphs/change-requests` | the graph of the requests |
 | `MODEL_DIR` | `/config/resources` | the mu-cl-resources JSON model files |
 | `CONFIG_FILE` | `/config/change-requests.json` | the aggregates and the ABB organisation (below) |
@@ -229,11 +229,11 @@ the resources model and the frontend; a new type is added to its aggregate.
 
 ```sh
 npm run setup    # once: the template's node_modules and its `mu` helper (needs docker)
-npm test         # 163 unit tests against OP's model; MODEL_DIR=../app-rvs/config/resources npm test for app-rvs's
-scripts/e2e-mock-login.sh   # the whole flow against a running app-rvs (mock-login as two gemeenten and ABB)
+npm test         # 163 unit tests against OP's model; MODEL_DIR=../app-lokale-verkenner/config/resources npm test for app-lokale-verkenner's
+scripts/e2e-mock-login.sh   # the whole flow against a running app-lokale-verkenner (mock-login as two gemeenten and ABB)
 ```
 
-How app-rvs runs the service, the test fixtures, the datatype table and the scripts are in
+How app-lokale-verkenner runs the service, the test fixtures, the datatype table and the scripts are in
 [docs/development.md](docs/development.md).
 
 ## Open points

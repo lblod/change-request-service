@@ -8,7 +8,7 @@ import { loadConfig } from '../../lib/config.js';
 export const MODEL_DIR = process.env.MODEL_DIR || path.resolve('../app-organization-portal/config/resources');
 if (!fs.existsSync(MODEL_DIR)) {
   throw new Error(
-    `The resources model directory ${MODEL_DIR} does not exist; point MODEL_DIR at app-rvs/config/resources ` +
+    `The resources model directory ${MODEL_DIR} does not exist; point MODEL_DIR at app-lokale-verkenner/config/resources ` +
       '(or app-organization-portal/config/resources)',
   );
 }
@@ -227,7 +227,7 @@ export const sessions = {
 
 /**
  * The kerngegevens page of Stad Aalst saved as one request. The documents carry only keys that
- * both OP's and app-rvs's model define, so the generated updates are the same under either.
+ * both OP's and app-lokale-verkenner's model define, so the generated updates are the same under either.
  */
 export const operations = [
   {

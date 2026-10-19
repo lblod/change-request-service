@@ -4,7 +4,7 @@ sparql-parser stays the single place where access is defined. The template sends
 `DEFAULT_MU_AUTH_SCOPE` with every query and forwards the user's session, so every write is still
 attributed to the user in deltas and logs. The service uses no sudo.
 
-## The configuration in app-rvs
+## The configuration in app-lokale-verkenner
 
 All data lives in `http://mu.semte.ch/graphs/public` and every session carries the `public` group
 (`config/authorization/config.lisp`):
@@ -48,7 +48,7 @@ All data lives in `http://mu.semte.ch/graphs/public` and every session carries t
   scope of the call (`acl/acl.lisp`, `accessible-graphs`); a grant without `with-scope` belongs to
   the no-scope call only. The service resolves the session with the same scoped query, so the
   scope must also read the graph where mock-login writes `session:account` and `ext:sessionGroup`
-  (`sessions`) and the graph of the persons (`foaf:account`; the public graph in app-rvs).
+  (`sessions`) and the graph of the persons (`foaf:account`; the public graph in app-lokale-verkenner).
 - **Placement follows the type specs, not the GRAPH clause.** The service names the graphs in its
   updates (correct on a bare triplestore too), but sparql-parser writes every quad to *every*
   writable graph whose `define-graph` matches the type of its subject, and refuses the update when
