@@ -67,9 +67,10 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
   [*] --> ingediend: indiening
+  state "informatie-gevraagd" as informatie_gevraagd
   ingediend --> informatie_gevraagd: informatievraag (ABB, with a question)
   informatie_gevraagd --> ingediend: informatieantwoord (the requester, with the answer)
-  ingediend --> goedgekeurd: goedkeuring (ABB; by the service for an edit or ABB's own request)
+  ingediend --> goedgekeurd: goedkeuring (ABB, or the service for an edit or ABB's own request)
   goedgekeurd --> afgehandeld: afhandeling (the service applies it, in the same update)
   goedgekeurd --> mislukt: afhandeling whose apply failed
   ingediend --> afgekeurd: afkeuring (ABB, with a reason)
