@@ -270,8 +270,10 @@ How app-lokale-verkenner runs the service, the test fixtures, the datatype table
 
 - `wijziging` (editing a pending request) is reserved and stays unused: a pending request is
   answered, contested or withdrawn, never amended.
-- No validation screen yet: ABB decides through the API; the Figma screens of 16 October 2026 are
-  the design for it (Alle aanvragen, Aanvraagformulier, Aanvraaggeschiedenis).
+- frontend-lokale-verkenner has the request screens (Alle aanvragen, the Aanvraagformulier with
+  its tabs and the decision modals, from the Figma screens of 16 October 2026); the forms that
+  submit a creation or a change-event request are not built yet, so those requests come through
+  the API.
 - A change-event request is about one organisation: events that involve several (fusie,
   samenvoeging) are not requests yet.
 - A creation needs the KBO number of a registered organisation; a lookup in the KBO is not built.

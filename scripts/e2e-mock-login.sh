@@ -132,7 +132,7 @@ creation_body() {
  {"op":"create","data":{"type":"sites","lid":"v1","relationships":{"address":{"data":{"type":"addresses","lid":"a1"}}}}},
  {"op":"create","data":{"type":"addresses","lid":"a1","attributes":{"street":"Grote Markt","number":"1","postcode":"9300","municipality":"$ORG_A_LABEL","country":"België","full-address":"Grote Markt 1, 9300 $ORG_A_LABEL, België"}}},
  {"op":"create","data":{"type":"change-events","lid":"e1","attributes":{"date":"2026-10-01","description":"Oprichting (test Lokale Verkenner)"},"relationships":{"type":{"data":{"type":"change-event-types","id":"$OPRICHTING"}},"original-organizations":{"data":[{"type":"administrative-units","lid":"o1"}]},"decision":{"data":{"type":"decisions","lid":"d1"}}}}},
- {"op":"create","data":{"type":"decisions","lid":"d1","attributes":{"document-link":"https://$ORG_A_LABEL.example.org/besluiten/2026/123"}}}
+ {"op":"create","data":{"type":"decisions","lid":"d1","attributes":{"document-links":["https://$ORG_A_LABEL.example.org/besluiten/2026/123"]}}}
 ]}}}
 JSON
 }
@@ -141,7 +141,7 @@ change_event_body() {
   cat <<JSON
 {"data":{"type":"change-requests","attributes":{"aggregate":"change-event","operations":[
  {"op":"create","data":{"type":"change-events","lid":"e1","attributes":{"date":"2026-10-02","description":"Naamswijziging (test Lokale Verkenner)"},"relationships":{"type":{"data":{"type":"change-event-types","id":"$NAAMSWIJZIGING"}},"original-organizations":{"data":[{"type":"administrative-units","id":"$1"}]},"decision":{"data":{"type":"decisions","lid":"d1"}}}}},
- {"op":"create","data":{"type":"decisions","lid":"d1","attributes":{"document-link":"https://$ORG_A_LABEL.example.org/besluiten/2026/124"}}},
+ {"op":"create","data":{"type":"decisions","lid":"d1","attributes":{"document-links":["https://$ORG_A_LABEL.example.org/besluiten/2026/124"]}}},
  {"op":"update","data":{"type":"administrative-units","id":"$1","attributes":{"name":"$2"},"meta":{"base":{"attributes":{"name":"$3"}}}}}
 ]},"relationships":{"target":{"data":{"type":"organizations","id":"$1"}}}}}
 JSON
