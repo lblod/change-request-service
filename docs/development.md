@@ -23,9 +23,10 @@ end
 ```
 
 - The template talks to `http://database:8890/sparql`, which is sparql-parser in app-lokale-verkenner.
-- A model that loads only part of OP's files (app-lokale-verkenner reads `domain.json` and `auth.json`) may
-  hold relationships to types it does not define; the service logs them at start-up and leaves them
-  out, as mu-cl-resources only fails when such a relationship is used.
+- A model that loads only part of OP's files may hold relationships to types it does not define;
+  the service logs them at start-up and leaves them out, as mu-cl-resources only fails when such
+  a relationship is used (app-lokale-verkenner loads `domain.json`, `auth.json` and
+  `change-events.json`; the creation and change-event aggregates need the last one).
 - A mounted checkout (`docker-compose.dev.yml`: `NODE_ENV: development`, sources at `/app`) does not
   get the Dockerfile's `ENV`, so set `MAX_BODY_SIZE` in the compose file.
 - Every type an aggregate names must exist in the model, and a reference cannot also be a member,
@@ -36,7 +37,7 @@ end
 ```sh
 npm run setup      # once: installs the template's node_modules and its `mu` helper locally (needs docker)
 npm test           # unit tests (node:test) against OP's model files
-MODEL_DIR=../app-lokale-verkenner/config/resources npm test   # the same against app-lokale-verkenner's files (domain.json and auth.json only)
+MODEL_DIR=../app-lokale-verkenner/config/resources npm test   # the same against app-lokale-verkenner's files
 npm run check      # node --check app.js
 ```
 

@@ -13,6 +13,7 @@ PREFIX task: <http://redpencil.data.gift/vocabularies/tasks/>
 PREFIX oslc: <http://open-services.net/ns/core#>
 PREFIX as: <https://www.w3.org/ns/activitystreams#>
 PREFIX org: <http://www.w3.org/ns/org#>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 
 INSERT DATA {

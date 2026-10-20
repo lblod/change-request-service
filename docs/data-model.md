@@ -76,11 +76,19 @@ the application graph.
 | link | `http://data.lblod.info/id/record-links/<uuid>` |
 | error | `http://redpencil.data.gift/id/jobs/error/<uuid>` |
 
-The statuses (ingediend, goedgekeurd, afgekeurd, ingetrokken, mislukt) and the step types
-(indiening, goedkeuring, afkeuring, intrekking, hertoepassing, wijziging) are `skos:Concept`s with
+The statuses (ingediend, informatie-gevraagd, goedgekeurd, afgehandeld, afgekeurd, ingetrokken,
+mislukt) and the step types (indiening, informatievraag, informatieantwoord, goedkeuring,
+afhandeling, afkeuring, betwisting, intrekking, hertoepassing, wijziging) are `skos:Concept`s with
 UUID URIs under `http://lblod.data.gift/concepts/`, in two schemes under
-`http://lblod.data.gift/concept-schemes/`. app-lokale-verkenner loads them with a migration; the service knows
-their URIs (`constants.js`).
+`http://lblod.data.gift/concept-schemes/`. app-lokale-verkenner loads them with two migrations
+(`20261015120000-add-change-request-code-lists`, `20261020120000-add-validation-flow-code-lists`);
+the service knows their URIs (`constants.js`). `goedgekeurd` is the decision and `afgehandeld` the
+applied state: an apply records a goedkeuring (the decision, by ABB or by the service) and an
+afhandeling (the service's, which carries the states it replaced), in one update; a failed apply
+leaves the afhandeling with status `mislukt`. A request to register a new organisation has the
+organisation's URI, minted at submission, as its `cr:target`; the organisation enters the
+application graph when the request is applied, so a listing reads its uuid and name from the
+proposed version until then.
 
 ## Example
 

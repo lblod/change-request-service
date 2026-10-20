@@ -72,29 +72,40 @@ All data lives in `http://mu.semte.ch/graphs/public` and every session carries t
 
 `policies/rules.js` holds one function per rule, `async (ctx) => "allow" | "deny" | undefined`.
 `ctx` is `{ session, account, actor: { uri, uuid, classification }, target: { uri, uuid,
-classification }, aggregate, operations, config }`, plus `conflicts` and `competing` (as the API
-renders them) for `autoApprove`, and `request: { uri, uuid, status, aggregate,
-requestingOrganisation }` for the steps on an existing request. The `supersede` rules get
-`{ applied: { uri, uuid, requestingOrganisation, target }, candidate: { uri, uuid,
-requestingOrganisation, fullyCovered }, config }`.
+classification, pending? }, aggregate, kind, operations, config }`, plus `conflicts` and
+`competing` (as the API renders them) for `autoApprove`, and `request: { uri, uuid, status,
+aggregate, requestingOrganisation }` for the steps on an existing request. `kind` is the kind of
+the aggregate (edit, creation, change-event); for a creation the target is the organisation the
+request would register, minted at submission, with the classification the document proposes. The
+`supersede` rules get `{ applied: { uri, uuid, requestingOrganisation, target }, candidate: { uri,
+uuid, requestingOrganisation, fullyCovered }, config }`.
 
 `policies/index.js` orders them; the first rule that answers decides, no answer means deny:
 
 ```js
-export const canEdit = [abbEditsAll, ownOrganisation];              // submit, and hertoepassing
-export const autoApprove = [holdOnConflict, always];                // applied at once, or waits
-export const canDecide = [abbDecidesAll];                           // goedkeuring, afkeuring
-export const canWithdraw = [abbEditsAll, requestingOrganisation];   // intrekking
-export const supersede = [supersededByOwnRequest];                  // older pending requests an apply withdraws
+export const canEdit = [abbEditsAll, ownOrganisation];                 // an edit or a change event on an existing organisation, and hertoepassing
+export const canCreate = [abbEditsAll, mayCreateClassification];       // a new organisation of a classification the actor manages
+export const autoApprove = [editsApplyAtOnce, abbAutoApproves];        // edits always; creations and change events only ABB's own
+export const canDecide = [abbDecidesAll];                              // goedkeuring, afkeuring, informatievraag
+export const canReply = [requestingOrganisation];                      // informatieantwoord, betwisting
+export const canWithdraw = [abbEditsAll, requestingOrganisation];      // intrekking
+export const supersede = [supersededByOwnRequest];                     // older pending requests an apply withdraws
 ```
 
 - The permissions endpoint, the POST and the steps run the same lists; the rule that allowed or
   decided a step is recorded on it (`cr:rule`), under its kebab-case name (`own-organisation`,
-  `abb-edits-all`, `hold-on-conflict`).
+  `abb-edits-all`, `may-create-classification`, `edits-apply-at-once`, `abb-auto-approves`).
+- `mayCreateClassification` reads `creatableClassifications` of the configuration: the
+  classification of the acting organisation maps to the classifications it may request ("Wie
+  beheert": a gemeente an AGB, an OCMW a welzijnsvereniging, ...).
+- Who sees a request is not a rule list but a filter on the listing: with `pendingVisibleTo`
+  `everyone` (the default) every logged-in user sees every request; with `involved` an
+  organisation sees the requests about it, those it submitted and the applied ones, and ABB all.
+  Whoever sees a request, the person who submitted it and the texts of its steps (questions,
+  answers, reasons) are shown to the requesting organisation and ABB only.
 - Later rules slot in without touching the flow: `memberOfTargetPartnership`,
-  `targetTypeIn([...])`, `aggregateIn([...])`. "Auto-approve when actor equals target, otherwise
-  ingediend" is a one-line change in `autoApprove`; so is holding a request that another pending
-  request competes with (`ctx.competing.length ? 'deny' : undefined`). The service does not hold
-  those by default: a competing request is pending because it was stale, and the newer form is
-  the one that saw the current values. Instead `supersededByOwnRequest` withdraws the older
-  request when it comes from the same organisation and the newer one rewrote all of its fields.
+  `targetTypeIn([...])`, `aggregateIn([...])`. Holding a request that another pending request
+  competes with is a one-line rule (`ctx.competing.length ? 'deny' : undefined`). The service does
+  not hold those: a competing request is pending because it was stale, and the newer form is the
+  one that saw the current values. Instead `supersededByOwnRequest` withdraws the older request
+  when it comes from the same organisation and the newer one rewrote all of its fields.

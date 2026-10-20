@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # End-to-end check of change-request-service in app-lokale-verkenner, as a browser would do it: through
-# mu-identifier, logged in with mock-login as two gemeenten and as ABB. Every change it makes is
-# put back at the end through change requests, and every request it leaves pending is closed (the
-# requests themselves stay, as history).
+# mu-identifier, logged in with mock-login as two gemeenten and as ABB. It walks the validation flow
+# of the designs: an edit of own data is applied at once and a stale one refused; a request to
+# register a new organisation and a veranderingsgebeurtenis wait for ABB (question, answer,
+# rejection, contest, approval); everyone sees the requests, only the involved see who and why.
+# Every change it makes is put back at the end: the organisations it registered and the change
+# event it applied are removed from the public graph (directly in Virtuoso: an organisation is never
+# deleted through a request), the requests stay as history, and the ones it leaves pending are
+# closed. The change-event types the dev data may lack are inserted for the run and removed again.
 #
 #   BASE_URL         the identifier (default http://localhost:88, app-lokale-verkenner docker-compose.dev.yml)
-#   SPARQL_ENDPOINT  Virtuoso, to look up accounts and check graphs (default http://localhost:8899/sparql)
+#   SPARQL_ENDPOINT  Virtuoso, to look up accounts, check graphs and clean up (default http://localhost:8899/sparql)
 #   ORG_A_LABEL, ORG_B_LABEL  two gemeenten by name (default Aalst and Gent)
 set -u
 BASE=${BASE_URL:-http://localhost:88}
@@ -21,6 +26,29 @@ nok() { echo "FAIL  $*"; fail=$((fail+1)); }
 check() { local name="$1" expected="$2" actual="$3"; if [ "$actual" = "$expected" ]; then ok "$name ($actual)"; else nok "$name: expected $expected, got $actual"; fi; }
 
 sparql() { curl -s -H 'Accept: application/sparql-results+json' --data-urlencode "query=$1" "$SPARQL"; }
+sparql_update() { curl -s -o /dev/null -w '%{http_code}' --data-urlencode "query=$1" "$SPARQL"; }
+ask() { sparql "ASK { $1 }" | python3 -c "import json,sys; print(json.load(sys.stdin)['boolean'])"; }
+
+PUBLIC=http://mu.semte.ch/graphs/public
+CRG=http://mu.semte.ch/graphs/change-requests
+CR=http://lblod.data.gift/vocabularies/change-requests/
+RDF=http://www.w3.org/1999/02/22-rdf-syntax-ns#
+DCT=http://purl.org/dc/terms/
+PROV=http://www.w3.org/ns/prov#
+MU=http://mu.semte.ch/vocabularies/core/
+SKOS=http://www.w3.org/2004/02/skos/core#
+ORG=http://www.w3.org/ns/org#
+CODE=http://lblod.data.gift/vocabularies/organisatie/
+CH=http://data.lblod.info/vocabularies/contacthub/
+GEMEENTE=http://data.vlaanderen.be/id/concept/BestuurseenheidClassificatieCode/5ab0e9b8a3b2ca7c5e000001
+ABBCODE=http://data.vlaanderen.be/id/concept/BestuurseenheidClassificatieCode/52cc9d8d-1c9a-4d92-9936-da9d4a622ec4
+# What a gemeente may request ("Wie beheert"): an autonoom gemeentebedrijf; a welzijnsvereniging is the OCMW's
+AGB=36a82ba0-7ff1-4697-a9dd-2e94df73b721
+AGB_URI=http://data.vlaanderen.be/id/concept/BestuurseenheidClassificatieCode/$AGB
+WELZIJNSVERENIGING=e8294b73-87c9-4fa2-9441-1937350763c9
+# Change-event types of OP's code list; the dev data gets them with the OP dump
+OPRICHTING=f0e2706a-3b64-4464-ad9c-4e65dc976288
+NAAMSWIJZIGING=6651dc69b0ae8f7ff9974e8a23db1dec
 
 # The service may still be starting: in development mode the template restarts it on every change
 # to the mounted sources. It answers 401 without a session once it is up (the dispatcher a 5xx before).
@@ -36,17 +64,26 @@ PREFIX mu: <http://mu.semte.ch/vocabularies/core/>
 PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
 PREFIX org: <http://www.w3.org/ns/org#>
 PREFIX foaf: <http://xmlns.com/foaf/0.1/>
-SELECT ?orgUuid ?accUuid ?personUuid WHERE { GRAPH <http://mu.semte.ch/graphs/public> {
+SELECT ?orgUuid ?accUuid ?personUuid WHERE { GRAPH <$PUBLIC> {
   ?org a besluit:Bestuurseenheid ; mu:uuid ?orgUuid ; skos:prefLabel \"$1\" ; org:classification <$2> .
   ?p foaf:member ?org ; foaf:account ?acc ; mu:uuid ?personUuid . ?acc mu:uuid ?accUuid . } } LIMIT 1" |
   python3 -c "import json,sys; b=json.load(sys.stdin)['results']['bindings'][0]; print(b['orgUuid']['value'], b['accUuid']['value'], b['personUuid']['value'])"
 }
-GEMEENTE=http://data.vlaanderen.be/id/concept/BestuurseenheidClassificatieCode/5ab0e9b8a3b2ca7c5e000001
-ABBCODE=http://data.vlaanderen.be/id/concept/BestuurseenheidClassificatieCode/52cc9d8d-1c9a-4d92-9936-da9d4a622ec4
 read -r A_ORG A_ACC A_PERSON < <(lookup "$ORG_A_LABEL" "$GEMEENTE")
 read -r B_ORG B_ACC B_PERSON < <(lookup "$ORG_B_LABEL" "$GEMEENTE")
 read -r ABB_ORG ABB_ACC ABB_PERSON < <(lookup "Agentschap Binnenlands Bestuur" "$ABBCODE")
 echo "A=$ORG_A_LABEL $A_ORG  B=$ORG_B_LABEL $B_ORG  ABB $ABB_ORG"
+
+# A change-event type the dev data may lack: inserted for the run, removed at the end.
+FIXTURES=()
+ensure_concept() { # uuid label
+  if [ "$(ask "GRAPH <$PUBLIC> { <http://lblod.data.gift/concepts/$1> <${MU}uuid> ?u }")" = False ]; then
+    sparql_update "INSERT DATA { GRAPH <$PUBLIC> { <http://lblod.data.gift/concepts/$1> a <${SKOS}Concept>, <${CODE}Veranderingsgebeurtenis> ; <${MU}uuid> \"$1\" ; <${SKOS}prefLabel> \"$2\" } }" >/dev/null
+    FIXTURES+=("$1")
+  fi
+}
+ensure_concept "$OPRICHTING" "Oprichting"
+ensure_concept "$NAAMSWIJZIGING" "Naamswijziging"
 
 login() { # jar account group
   curl -s -o /dev/null -w '%{http_code}' -c "$1" -b "$1" -X POST -H "$J" -H "$CT" \
@@ -69,11 +106,13 @@ def steps(d=d):
     return ' | '.join(' '.join(str(s[k]) for k in ('sequence', 'type', 'status', 'agent', 'person', 'organisation', 'rule')) for s in d['data']['attributes']['steps'])
 def conflicts(items):
     return ' | '.join(f"{c['resource']['type']} {c['key']}: base {c['base']}, current {c['current']}, proposed {c['proposed']}, competing {','.join(c['competing-requests']) or '-'}" for c in items)
+def ids(d=d):
+    return [r['id'] for r in d['data']]
 value = eval(sys.argv[1])
 print(json.dumps(value) if isinstance(value, (dict, list)) or value is None else value)
 PY
 }
-cr_body() { # target operations-json
+cr_body() { # target operations-json: an edit of the kerngegevens
   printf '{"data":{"type":"change-requests","attributes":{"aggregate":"organization-core-data","operations":%s},"relationships":{"target":{"data":{"type":"organizations","id":"%s"}}}}}' "$2" "$1"
 }
 rename() { # jar target name
@@ -82,19 +121,49 @@ rename() { # jar target name
 stale_rename() { # jar target name base-name: a form that loaded base-name proposes name
   post "$1" /change-requests "$(cr_body "$2" "[{\"op\":\"update\",\"data\":{\"type\":\"administrative-units\",\"id\":\"$2\",\"attributes\":{\"name\":\"$3\"},\"meta\":{\"base\":{\"attributes\":{\"name\":\"$4\"}}}}}]")"
 }
+# creation_body name kbo classification-uuid reason: a gemeente registers a new organisation with its
+# KBO number, its site and the oprichting with the link to the besluit
+creation_body() {
+  cat <<JSON
+{"data":{"type":"change-requests","attributes":{"aggregate":"new-organisation","reason":"$4","operations":[
+ {"op":"create","data":{"type":"administrative-units","lid":"o1","attributes":{"name":"$1","legal-name":"$1 (juridische naam)"},"relationships":{"classification":{"data":{"type":"administrative-unit-classification-codes","id":"$3"}},"identifiers":{"data":[{"type":"identifiers","lid":"i1"}]},"primary-site":{"data":{"type":"sites","lid":"v1"}},"sites":{"data":[{"type":"sites","lid":"v1"}]}}}},
+ {"op":"create","data":{"type":"identifiers","lid":"i1","attributes":{"id-name":"KBO nummer"},"relationships":{"structured-identifier":{"data":{"type":"structured-identifiers","lid":"s1"}}}}},
+ {"op":"create","data":{"type":"structured-identifiers","lid":"s1","attributes":{"local-id":"$2"}}},
+ {"op":"create","data":{"type":"sites","lid":"v1","relationships":{"address":{"data":{"type":"addresses","lid":"a1"}}}}},
+ {"op":"create","data":{"type":"addresses","lid":"a1","attributes":{"street":"Grote Markt","number":"1","postcode":"9300","municipality":"$ORG_A_LABEL","country":"België","full-address":"Grote Markt 1, 9300 $ORG_A_LABEL, België"}}},
+ {"op":"create","data":{"type":"change-events","lid":"e1","attributes":{"date":"2026-10-01","description":"Oprichting (test Lokale Verkenner)"},"relationships":{"type":{"data":{"type":"change-event-types","id":"$OPRICHTING"}},"original-organizations":{"data":[{"type":"administrative-units","lid":"o1"}]},"decision":{"data":{"type":"decisions","lid":"d1"}}}}},
+ {"op":"create","data":{"type":"decisions","lid":"d1","attributes":{"document-link":"https://$ORG_A_LABEL.example.org/besluiten/2026/123"}}}
+]}}}
+JSON
+}
+# change_event_body target new-name base-name: a naamswijziging about the target, with the besluit and the new name on the organisation
+change_event_body() {
+  cat <<JSON
+{"data":{"type":"change-requests","attributes":{"aggregate":"change-event","operations":[
+ {"op":"create","data":{"type":"change-events","lid":"e1","attributes":{"date":"2026-10-02","description":"Naamswijziging (test Lokale Verkenner)"},"relationships":{"type":{"data":{"type":"change-event-types","id":"$NAAMSWIJZIGING"}},"original-organizations":{"data":[{"type":"administrative-units","id":"$1"}]},"decision":{"data":{"type":"decisions","lid":"d1"}}}}},
+ {"op":"create","data":{"type":"decisions","lid":"d1","attributes":{"document-link":"https://$ORG_A_LABEL.example.org/besluiten/2026/124"}}},
+ {"op":"update","data":{"type":"administrative-units","id":"$1","attributes":{"name":"$2"},"meta":{"base":{"attributes":{"name":"$3"}}}}}
+]},"relationships":{"target":{"data":{"type":"organizations","id":"$1"}}}}}
+JSON
+}
 take_step() { # jar request-id step-type [reason] [override]
   local attributes="\"step-type\":\"$3\""
   if [ -n "${4:-}" ]; then attributes="$attributes,\"reason\":\"$4\""; fi
   if [ -n "${5:-}" ]; then attributes="$attributes,\"override\":$5"; fi
   post "$1" "/change-requests/$2/steps" "{\"data\":{\"type\":\"change-request-steps\",\"attributes\":{$attributes}}}"
 }
-PENDING=()  # requests this run leaves ingediend for a while; closed at the end if still pending
-ask() { sparql "ASK { $1 }" | python3 -c "import json,sys; print(json.load(sys.stdin)['boolean'])"; }
-CR=http://lblod.data.gift/vocabularies/change-requests/
-RDF=http://www.w3.org/1999/02/22-rdf-syntax-ns#
-DCT=http://purl.org/dc/terms/
-PROV=http://www.w3.org/ns/prov#
-MU=http://mu.semte.ch/vocabularies/core/
+PENDING=()   # requests this run leaves waiting for a while; closed at the end if still pending
+CREATED=()   # uuids of records this run wrote to the public graph outside the kerngegevens of A; removed at the end
+remember_lids() { # the uuids the last answer minted
+  while read -r id; do CREATED+=("$id"); done < <(py "'\n'.join(a['lids'].values())" | tr -d '"')
+}
+remove_record() { # uuid: a record and the links to it, out of the public graph (test data of this run)
+  sparql_update "DELETE { GRAPH <$PUBLIC> { ?x ?q ?s } } WHERE { GRAPH <$PUBLIC> { ?s <${MU}uuid> \"$1\" . ?x ?q ?s } }" >/dev/null
+  sparql_update "DELETE { GRAPH <$PUBLIC> { ?s ?p ?o } } WHERE { GRAPH <$PUBLIC> { ?s <${MU}uuid> \"$1\" ; ?p ?o } }" >/dev/null
+}
+RUN_START=$(date -u -d '-5 seconds' +%Y-%m-%dT%H:%M:%SZ)
+STAMP=$(date +%s)
+KBO1="0${STAMP: -9}"; KBO2="1${STAMP: -9}"; KBO3="2${STAMP: -9}"   # ten digits, unique per run
 
 JA=$TMP/a; JB=$TMP/b; JABB=$TMP/abb; JANON=$TMP/anon
 check "mock-login as A" 201 "$(login "$JA" "$A_ACC" "$A_ORG")"
@@ -108,24 +177,28 @@ check "anonymous read of an organisation (the public graph is readable without l
 fetch "$JA" "/administrative-units/$A_ORG" >/dev/null
 A_LEGAL=$(py "json.dumps(a.get('legal-name'))")
 
-perm() { get "$1" "/change-requests/permissions?target=$2" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('can-edit'), ','.join(d.get('rules',[])))"; }
-check "permissions: A on A" "True own-organisation" "$(perm "$JA" "$A_ORG")"
-check "permissions: B on A" "False " "$(perm "$JB" "$A_ORG")"
-check "permissions: ABB on B" "True abb-edits-all" "$(perm "$JABB" "$B_ORG")"
+# --- permissions ------------------------------------------------------------------------------------
+perm() { fetch "$1" "/change-requests/permissions?target=$2" >/dev/null; py "f\"{d.get('can-edit')} {d.get('can-submit-change-event')} {d.get('can-decide')} {','.join(d.get('rules', []))}\""; }
+check "permissions: A on A edits itself and registers events about itself, does not decide" "True True False own-organisation" "$(perm "$JA" "$A_ORG")"
+check "permissions: B on A: nothing" "False False False " "$(perm "$JB" "$A_ORG")"
+check "permissions: ABB on B: edits everything and decides" "True True True abb-edits-all" "$(perm "$JABB" "$B_ORG")"
+check "permissions without a target: a gemeente may request an AGB (Wie beheert), not a welzijnsvereniging" "True False False" "$(fetch "$JA" "/change-requests/permissions" >/dev/null; py "f\"{'$AGB_URI' in d['can-create']} {any(u.endswith('$WELZIJNSVERENIGING') for u in d['can-create'])} {d['can-decide']}\"")"
+check "permissions without a target: ABB may request every configured classification and decides" "True True" "$(fetch "$JABB" "/change-requests/permissions" >/dev/null; py "f\"{len(d['can-create']) > 10} {d['can-decide']}\"")"
 check "permissions without login" 401 "$(code "$JANON" "/change-requests/permissions?target=$A_ORG")"
 
-# --- an auto-approved request and its steps ------------------------------------------------------
+# --- an edit is applied at once ----------------------------------------------------------------------
 NAME0="$A_NAME (test Lokale Verkenner)"
 check "A renames itself through a change request" 201 "$(rename "$JA" "$A_ORG" "$NAME0")"
-check "the request is applied at once" goedgekeurd "$(py "a['status']")"
+check "the request is applied at once: afgehandeld, kind edit, mine" "afgehandeld edit True" "$(py "f\"{a['status']} {a['kind']} {a['mine']}\"")"
 AUTO_ID=$(py "d['data']['id']")
-EXPECTED_STEPS="1 indiening ingediend user $A_PERSON $A_ORG own-organisation | 2 goedkeuring goedgekeurd service None None always"
-check "its steps: indiening by A's person and organisation, goedkeuring by the service (rule always)" "$EXPECTED_STEPS" "$(py "steps()")"
+EXPECTED_STEPS="1 indiening ingediend user $A_PERSON $A_ORG own-organisation | 2 goedkeuring goedgekeurd service None None edits-apply-at-once | 3 afhandeling afgehandeld service None None None"
+check "its steps: indiening by A's person and organisation, goedkeuring by the service (rule edits-apply-at-once), afhandeling by the service" "$EXPECTED_STEPS" "$(py "steps()")"
 check "its status is the status of its last step" True "$(py "a['status'] == a['steps'][-1]['status']")"
 check "the new name is visible through mu-cl-resources" "$NAME0" "$(name_of "$JA" "$A_ORG")"
 check "the stored request reads back" 200 "$(fetch "$JA" "/change-requests/$AUTO_ID")"
 check "the stored steps read back the same" "$EXPECTED_STEPS" "$(py "steps()")"
-check "applied-at is the start of the goedkeuring step" True "$(py "a['applied-at'] == a['steps'][1]['at'] and a['error'] is None and a['conflicts'] == []")"
+check "applied-at is the start of the afhandeling step; the target is named and classified" "True $NAME0 5ab0e9b8a3b2ca7c5e000001" "$(py "f\"{a['applied-at'] == a['steps'][2]['at'] and a['error'] is None and a['conflicts'] == []} {a['target-name']} {a['target-classification']}\"")"
+check "the detail returns the operations as submitted" "update administrative-units $A_ORG $NAME0" "$(py "f\"{a['operations'][0]['op']} {a['operations'][0]['data']['type']} {a['operations'][0]['data']['id']} {a['operations'][0]['data']['attributes']['name']}\"")"
 
 check "B cannot rename A" 403 "$(rename "$JB" "$A_ORG" "Gent was here")"
 check "A keeps its name" "$NAME0" "$(name_of "$JA" "$A_ORG")"
@@ -136,96 +209,127 @@ forged=$(curl -s -o /dev/null -w '%{http_code}' -c "$JA" -b "$JA" -X PATCH -H "$
 if [ "$forged" != 200 ] && [ "$forged" != 204 ]; then ok "a PATCH with forged mu-auth-scope and mu-auth-sudo headers is refused ($forged)"; else nok "a forged-scope PATCH succeeded ($forged)"; fi
 check "A still carries the change-request name" "$NAME0" "$(name_of "$JA" "$A_ORG")"
 
-list_count() { get "$1" "/change-requests?filter[target]=$2" | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']))"; }
-na=$(list_count "$JA" "$A_ORG"); nb=$(list_count "$JB" "$A_ORG"); nabb=$(list_count "$JABB" "$A_ORG")
+# --- everyone sees the requests; who and why only the involved --------------------------------------------
+list_count() { fetch "$1" "/change-requests?$2" >/dev/null; py "d['meta']['count']"; }
+na=$(list_count "$JA" "filter[target]=$A_ORG"); nb=$(list_count "$JB" "filter[target]=$A_ORG"); nabb=$(list_count "$JABB" "filter[target]=$A_ORG")
 [ "$na" -ge 1 ] && ok "A lists its requests ($na)" || nok "A lists $na requests"
-check "B lists none of A's requests" 0 "$nb"
-[ "$nabb" -ge 1 ] && ok "ABB lists A's requests ($nabb)" || nok "ABB lists $nabb requests"
-fetch "$JA" "/change-requests?filter[target]=$A_ORG" >/dev/null
-check "every listed request has steps and conflicts" True "$(py "all(isinstance(r['attributes']['steps'], list) and isinstance(r['attributes']['conflicts'], list) for r in d['data'])")"
+check "B lists A's requests too: everyone sees every request" "$na" "$nb"
+check "and so does ABB" "$na" "$nabb"
+check "A sees who submitted its request: mine, with the person on the step" "True $A_PERSON" "$(fetch "$JA" "/change-requests/$AUTO_ID" >/dev/null; py "f\"{a['mine']} {a['steps'][0]['person']}\"")"
+check "B sees the request but not the person: not mine, person hidden, the organisation shown" "False None $A_ORG" "$(fetch "$JB" "/change-requests/$AUTO_ID" >/dev/null; py "f\"{a['mine']} {a['steps'][0]['person']} {a['steps'][0]['organisation']}\"")"
+check "ABB sees the person" "$A_PERSON" "$(fetch "$JABB" "/change-requests/$AUTO_ID" >/dev/null; py "a['steps'][0]['person']")"
+check "filter[mine]: the requests A's person submitted about A (ABB's renames are not mine), none for B" "$(list_count "$JA" "filter[target]=$A_ORG&filter[requester]=$A_ORG") 0" "$(list_count "$JA" "filter[target]=$A_ORG&filter[mine]=true") $(list_count "$JB" "filter[target]=$A_ORG&filter[mine]=true")"
+check "filter[kind]=edit,change-event lists the requests about A, filter[kind]=creation none of them" "$na 0" "$(list_count "$JA" "filter[target]=$A_ORG&filter[kind]=edit,change-event") $(list_count "$JA" "filter[target]=$A_ORG&filter[kind]=creation")"
+check "the list is oldest first; sort=-created newest first" "True True" "$(fetch "$JA" "/change-requests?filter[target]=$A_ORG" >/dev/null; py "d['data'][0]['attributes']['created'] <= d['data'][-1]['attributes']['created']") $(fetch "$JA" "/change-requests?filter[target]=$A_ORG&sort=-created" >/dev/null; py "d['data'][0]['attributes']['created'] >= d['data'][-1]['attributes']['created']")"
+check "every listed request has steps and conflicts, and no operations (the detail has them)" True "$(fetch "$JA" "/change-requests?filter[target]=$A_ORG" >/dev/null; py "all(isinstance(r['attributes']['steps'], list) and isinstance(r['attributes']['conflicts'], list) and 'operations' not in r['attributes'] for r in d['data'])")"
 check "the list is paged: page[size]=1 gives one request, meta.count counts them all, next links the rest" "1 True True" "$(fetch "$JA" "/change-requests?filter[target]=$A_ORG&page[size]=1" >/dev/null; py "f\"{len(d['data'])} {d['meta']['count'] >= $na} {('next' in d['links']) == (d['meta']['count'] > 1)}\"")"
 check "a page size above the maximum: 400" 400 "$(code "$JA" "/change-requests?page[size]=1000")"
+check "an unknown kind: 400" 400 "$(code "$JA" "/change-requests?filter[kind]=foo")"
 
-# --- a stale form: ABB renamed A after A's page loaded it -----------------------------------------
+# --- a stale form is refused: ABB renamed A after A's page loaded it ------------------------------------
 ABB_NAME="$A_NAME (ABB, test Lokale Verkenner)"
 check "ABB renames A" 201 "$(rename "$JABB" "$A_ORG" "$ABB_NAME")"
-check "ABB's rename is applied" goedgekeurd "$(py "a['status']")"
+check "ABB's rename is applied (rule abb-edits-all, then edits-apply-at-once)" "afgehandeld abb-edits-all edits-apply-at-once" "$(py "f\"{a['status']} {a['steps'][0]['rule']} {a['steps'][1]['rule']}\"")"
+before=$(list_count "$JABB" "filter[target]=$A_ORG")
 
 STALE="$A_NAME (A, stale form)"
-check "A submits a rename from a form that still shows the old name" 201 "$(stale_rename "$JA" "$A_ORG" "$STALE" "$NAME0")"
-P1=$(py "d['data']['id']"); PENDING+=("$P1")
-check "the request waits: status ingediend, only the indiening step" "ingediend 1" "$(py "a['status'] + ' ' + str(len(a['steps']))")"
-check "A's change of the name is listed as a conflict" "administrative-units name: base $NAME0, current $ABB_NAME, proposed $STALE, competing -" "$(py "conflicts(a['conflicts'])")"
-check "nothing is applied: the name is ABB's" "$ABB_NAME" "$(name_of "$JA" "$A_ORG")"
-
-OTHER="$A_NAME (A, another stale form)"
-check "a second stale form proposes another name" 201 "$(stale_rename "$JA" "$A_ORG" "$OTHER" "$NAME0")"
-P2=$(py "d['data']['id']"); PENDING+=("$P2")
-check "it waits too, and names the first pending request as competing" "ingediend administrative-units name: base $NAME0, current $ABB_NAME, proposed $OTHER, competing $P1" "$(py "a['status'] + ' ' + conflicts(a['conflicts'])")"
-check "ABB reads the first pending request" 200 "$(fetch "$JABB" "/change-requests/$P1")"
-check "its conflict is computed live and names the second as competing" "administrative-units name: base $NAME0, current $ABB_NAME, proposed $STALE, competing $P2" "$(py "conflicts(a['conflicts'])")"
+check "A submits a rename from a form that still shows the old name: 409, nothing saved" 409 "$(stale_rename "$JA" "$A_ORG" "$STALE" "$NAME0")"
+check "the 409 lists the conflict" "administrative-units name: base $NAME0, current $ABB_NAME, proposed $STALE, competing -" "$(py "conflicts(d['errors'][0]['meta']['conflicts'])")"
+check "the name is ABB's and no request was written" "$ABB_NAME $before" "$(name_of "$JA" "$A_ORG") $(list_count "$JABB" "filter[target]=$A_ORG")"
 
 LEGAL="$A_NAME (legal name, test Lokale Verkenner)"
 SAME_FORM=$(cr_body "$A_ORG" "[{\"op\":\"update\",\"data\":{\"type\":\"administrative-units\",\"id\":\"$A_ORG\",\"attributes\":{\"name\":\"$NAME0\",\"legal-name\":\"$LEGAL\"},\"meta\":{\"base\":{\"attributes\":{\"name\":\"$NAME0\",\"legal-name\":$A_LEGAL}}}}}]")
 check "the same stale form changes only the legal name (the old name carried unchanged)" 201 "$(post "$JA" /change-requests "$SAME_FORM")"
-check "it is applied: no conflict on a key the user did not change" "goedgekeurd []" "$(py "a['status'] + ' ' + json.dumps(a['conflicts'])")"
+check "it is applied: no conflict on a key the user did not change" "afgehandeld []" "$(py "a['status'] + ' ' + json.dumps(a['conflicts'])")"
 fetch "$JA" "/administrative-units/$A_ORG" >/dev/null
 check "the legal name is changed and the name is NOT reverted" "$LEGAL / $ABB_NAME" "$(py "a['legal-name'] + ' / ' + a['name']")"
 
-# --- deciding on pending requests: approval re-checks, rejection, withdrawal -------------------------
-check "ABB's approval of the second pending request without override: 409, conflicts re-checked" 409 "$(take_step "$JABB" "$P2" goedkeuring)"
-check "the 409 lists the conflict" "administrative-units name: base $NAME0, current $ABB_NAME, proposed $OTHER, competing $P1" "$(py "conflicts(d['errors'][0]['meta']['conflicts'])")"
-TOKEN=$(py "d['errors'][0]['meta']['conflicts-token']")
-check "the 409 carries the token of these conflicts, the one GET shows" "$TOKEN" "$(fetch "$JABB" "/change-requests/$P2" >/dev/null; py "a['conflicts-token']")"
-check "approving with the token of other conflicts: 409, nothing applied" "409 $ABB_NAME" "$(take_step "$JABB" "$P2" goedkeuring "" '"0123abcd"') $(name_of "$JA" "$A_ORG")"
-check "override true is refused: it must be the token of the conflicts reviewed" 422 "$(take_step "$JABB" "$P2" goedkeuring "" true)"
-check "a rejection without a reason: 422" 422 "$(take_step "$JABB" "$P1" afkeuring)"
-REASON="De naam werd intussen door ABB aangepast"
-check "ABB rejects the first pending request with a reason" 201 "$(take_step "$JABB" "$P1" afkeuring "$REASON")"
-check "it is afgekeurd; the step carries ABB's person and organisation, the rule and the reason" "afgekeurd | 2 afkeuring afgekeurd user $ABB_PERSON $ABB_ORG abb-decides-all | $REASON" "$(py "a['status'] + ' | ' + steps().split(' | ')[1] + ' | ' + a['steps'][1]['reason']")"
-check "the rejection reads back from the store" "2 afkeuring afgekeurd user $ABB_PERSON $ABB_ORG abb-decides-all $REASON" "$(fetch "$JA" "/change-requests/$P1" >/dev/null; py "steps().split(' | ')[1] + ' ' + a['steps'][1]['reason']")"
-check "approving the rejected request: 409, afgekeurd is final" 409 "$(take_step "$JABB" "$P1" goedkeuring)"
-check "withdrawing it: 409 as well" 409 "$(take_step "$JA" "$P1" intrekking)"
-check "A withdraws its second pending request" 201 "$(take_step "$JA" "$P2" intrekking)"
-check "it is ingetrokken; the step is A's (rule requesting-organisation)" "ingetrokken | 2 intrekking ingetrokken user $A_PERSON $A_ORG requesting-organisation" "$(py "a['status'] + ' | ' + steps().split(' | ')[1]")"
-check "the name is still ABB's" "$ABB_NAME" "$(name_of "$JA" "$A_ORG")"
+# --- a new organisation: a gemeente requests an AGB, ABB validates ----------------------------------------
+NEW_NAME="AGB $ORG_A_LABEL (test Lokale Verkenner $STAMP)"
+REASON="Opgericht bij besluit van de gemeenteraad van 1 oktober 2026"
+check "A requests a new AGB with its KBO number, site and oprichting" 201 "$(post "$JA" /change-requests "$(creation_body "$NEW_NAME" "$KBO1" "$AGB" "$REASON")")"
+CREATE_ID=$(py "d['data']['id']"); PENDING+=("$CREATE_ID")
+NEW_ORG=$(py "d['data']['relationships']['target']['data']['id']")
+remember_lids
+check "it waits: ingediend, kind creation, the target pending, named and classified from the proposal" "ingediend creation True $NEW_NAME $AGB" "$(py "f\"{a['status']} {a['kind']} {d['data']['relationships']['target'].get('meta', {}).get('pending')} {a['target-name']} {a['target-classification']}\"")"
+check "the organisation got its uuid at submission (the lid o1), and the request carries the reason on its indiening" "True may-create-classification $REASON" "$(py "f\"{a['lids']['o1'] == '$NEW_ORG'} {a['steps'][0]['rule']} {a['steps'][0]['reason']}\"")"
+check "the organisation does not exist yet" 404 "$(code "$JA" "/administrative-units/$NEW_ORG")"
+check "a second request with the same KBO number: 409, it names the waiting request" "409 $CREATE_ID" "$(post "$JA" /change-requests "$(creation_body "$NEW_NAME (bis)" "$KBO1" "$AGB" "")") $(py "d['errors'][0]['meta']['change-request']['id']")"
+check "a gemeente may not request a welzijnsvereniging: 403, no rule allowed it" "403 null" "$(post "$JA" /change-requests "$(creation_body "Welzijnsvereniging (test)" "$KBO3" "$WELZIJNSVERENIGING" "")") $(py "d['errors'][0]['meta']['rule']")"
+check "a creation with a target: 422" 422 "$(post "$JA" /change-requests "$(creation_body "x" "$KBO3" "$AGB" "" | python3 -c "import json,sys; d=json.load(sys.stdin); d['data']['relationships']={'target':{'data':{'type':'organizations','id':'$A_ORG'}}}; print(json.dumps(d))")")"
+check "B lists the waiting creation (everyone sees), without the person or the reason" "True False None None" "$(fetch "$JB" "/change-requests?filter[kind]=creation&filter[requester]=$A_ORG" >/dev/null; py "f\"{'$CREATE_ID' in ids()} {[r for r in d['data'] if r['id']=='$CREATE_ID'][0]['attributes']['mine']} {[r for r in d['data'] if r['id']=='$CREATE_ID'][0]['attributes']['steps'][0]['person']} {[r for r in d['data'] if r['id']=='$CREATE_ID'][0]['attributes']['steps'][0]['reason']}\"")"
+check "ABB sees the person and the reason" "$A_PERSON $REASON" "$(fetch "$JABB" "/change-requests/$CREATE_ID" >/dev/null; py "f\"{a['steps'][0]['person']} {a['steps'][0]['reason']}\"")"
+check "filter[target-classification] finds the waiting creation through what it proposes" True "$(fetch "$JB" "/change-requests?filter[target-classification]=$AGB&filter[status]=ingediend" >/dev/null; py "'$CREATE_ID' in ids()")"
+check "filter[created][gte] (this run) finds it, filter[created][lte] (before this run) does not" "True False" "$(fetch "$JB" "/change-requests?filter[created][gte]=$RUN_START&filter[kind]=creation" >/dev/null; py "'$CREATE_ID' in ids()") $(fetch "$JB" "/change-requests?filter[created][lte]=$RUN_START&filter[kind]=creation" >/dev/null; py "'$CREATE_ID' in ids()")"
 
-# --- a newer request of the same organisation replaces its older pending one -------------------------
-AGAIN="$A_NAME (A, stale form again)"
-check "A submits a rename from a stale form once more" 201 "$(stale_rename "$JA" "$A_ORG" "$AGAIN" "$NAME0")"
+check "B cannot ask for information on A's request: 403" 403 "$(take_step "$JB" "$CREATE_ID" informatievraag "Welk besluit?")"
+check "A cannot approve its own request: 403" 403 "$(take_step "$JA" "$CREATE_ID" goedkeuring)"
+check "ABB asks for information without a question: 422" 422 "$(take_step "$JABB" "$CREATE_ID" informatievraag)"
+QUESTION="Kan u het besluit van de gemeenteraad bezorgen?"
+check "ABB asks for information" 201 "$(take_step "$JABB" "$CREATE_ID" informatievraag "$QUESTION")"
+check "the request is informatie-gevraagd; the step is ABB's with the question" "informatie-gevraagd | 2 informatievraag informatie-gevraagd user $ABB_PERSON $ABB_ORG abb-decides-all | $QUESTION" "$(py "a['status'] + ' | ' + steps().split(' | ')[1] + ' | ' + a['steps'][1]['reason']")"
+check "ABB cannot approve while the question is open: 409" 409 "$(take_step "$JABB" "$CREATE_ID" goedkeuring)"
+check "B cannot answer for A: 403" 403 "$(take_step "$JB" "$CREATE_ID" informatieantwoord "Hier is het")"
+check "A answers without text: 422" 422 "$(take_step "$JA" "$CREATE_ID" informatieantwoord)"
+ANSWER="Zie https://$ORG_A_LABEL.example.org/besluiten/2026/123"
+check "A answers" 201 "$(take_step "$JA" "$CREATE_ID" informatieantwoord "$ANSWER")"
+check "the request is back in validation: ingediend; the step is A's (rule requesting-organisation)" "ingediend | 3 informatieantwoord ingediend user $A_PERSON $A_ORG requesting-organisation" "$(py "a['status'] + ' | ' + steps().split(' | ')[2]")"
+check "B reads the thread without its texts" "None None" "$(fetch "$JB" "/change-requests/$CREATE_ID" >/dev/null; py "f\"{a['steps'][1]['reason']} {a['steps'][2]['reason']}\"")"
+check "A reads the thread with its texts" "$QUESTION / $ANSWER" "$(fetch "$JA" "/change-requests/$CREATE_ID" >/dev/null; py "a['steps'][1]['reason'] + ' / ' + a['steps'][2]['reason']")"
+check "a rejection without a reason: 422" 422 "$(take_step "$JABB" "$CREATE_ID" afkeuring)"
+REJECTION="Het KBO-nummer hoort niet bij een AGB"
+check "ABB rejects with a reason" 201 "$(take_step "$JABB" "$CREATE_ID" afkeuring "$REJECTION")"
+check "it is afgekeurd" "afgekeurd | 4 afkeuring afgekeurd user $ABB_PERSON $ABB_ORG abb-decides-all | $REJECTION" "$(py "a['status'] + ' | ' + steps().split(' | ')[3] + ' | ' + a['steps'][3]['reason']")"
+check "a rejected request cannot be withdrawn: 409" 409 "$(take_step "$JA" "$CREATE_ID" intrekking)"
+check "nor approved: 409" 409 "$(take_step "$JABB" "$CREATE_ID" goedkeuring)"
+check "A contests without a reason: 422" 422 "$(take_step "$JA" "$CREATE_ID" betwisting)"
+CONTEST="Het KBO-nummer is wel degelijk dat van het AGB, zie de bijlage van het besluit"
+check "A contests the rejection" 201 "$(take_step "$JA" "$CREATE_ID" betwisting "$CONTEST")"
+check "the request is in validation again" "ingediend | 5 betwisting ingediend user $A_PERSON $A_ORG requesting-organisation" "$(py "a['status'] + ' | ' + steps().split(' | ')[4]")"
+check "ABB approves" 201 "$(take_step "$JABB" "$CREATE_ID" goedkeuring)"
+check "it is afgehandeld: ABB's goedkeuring and the service's afhandeling" "afgehandeld | 6 goedkeuring goedgekeurd user $ABB_PERSON $ABB_ORG abb-decides-all | 7 afhandeling afgehandeld service None None None" "$(py "a['status'] + ' | ' + ' | '.join(steps().split(' | ')[5:7])")"
+check "applied-at is the afhandeling; the target is no longer pending" "True False" "$(py "f\"{a['applied-at'] == a['steps'][6]['at']} {'meta' in d['data']['relationships']['target']}\"")"
+check "the organisation exists now, with its name" "$NEW_NAME" "$(name_of "$JA" "$NEW_ORG")"
+check "with its KBO number" "$KBO1" "$(get "$JA" "/administrative-units/$NEW_ORG/identifiers?include=structured-identifier" | python3 -c "import json,sys; d=json.load(sys.stdin); print(','.join(i['attributes'].get('local-id','') for i in d.get('included',[]) if i['type']=='structured-identifiers'))")"
+check "classified as an AGB, with its site and its oprichting with the link to the besluit, in the public graph" True "$(ask "GRAPH <$PUBLIC> { ?o <${MU}uuid> \"$NEW_ORG\" ; <${ORG}classification> <$AGB_URI> ; <${ORG}hasSite> ?s . ?e a <${ORG}ChangeEvent> ; <${ORG}originalOrganization> ?o ; <http://data.europa.eu/m8g/hasFormalFramework> ?d . ?d <http://xmlns.com/foaf/0.1/page> ?link }")"
+check "the detail returns the seven operations, the organisation first under its minted uuid" "7 create administrative-units $NEW_ORG $NEW_NAME" "$(fetch "$JA" "/change-requests/$CREATE_ID" >/dev/null; py "f\"{len(a['operations'])} {a['operations'][0]['op']} {a['operations'][0]['data']['type']} {a['operations'][0]['data']['id']} {a['operations'][0]['data']['attributes']['name']}\"")"
+check "filter[target-classification] still finds it, now through the organisation" True "$(fetch "$JB" "/change-requests?filter[target-classification]=$AGB&filter[status]=afgehandeld" >/dev/null; py "'$CREATE_ID' in ids()")"
+check "the same KBO number again: 409, it names the registered organisation" "409 $NEW_ORG" "$(post "$JA" /change-requests "$(creation_body "$NEW_NAME (ter)" "$KBO1" "$AGB" "")") $(py "d['errors'][0]['meta']['organisation']['id']")"
+
+ABB_NEW="AGB van ABB (test Lokale Verkenner $STAMP)"
+check "ABB registers an organisation itself" 201 "$(post "$JABB" /change-requests "$(creation_body "$ABB_NEW" "$KBO2" "$AGB" "")")"
+ABB_NEW_ORG=$(py "d['data']['relationships']['target']['data']['id']"); remember_lids
+check "it is applied at once (rule abb-auto-approves)" "afgehandeld | 1 indiening ingediend user $ABB_PERSON $ABB_ORG abb-edits-all | 2 goedkeuring goedgekeurd service None None abb-auto-approves | 3 afhandeling afgehandeld service None None None" "$(py "a['status'] + ' | ' + steps()")"
+check "the organisation exists" "$ABB_NEW" "$(name_of "$JABB" "$ABB_NEW_ORG")"
+
+check "A requests another organisation" 201 "$(post "$JA" /change-requests "$(creation_body "Derde AGB (test Lokale Verkenner $STAMP)" "$KBO3" "$AGB" "")")"
 P3=$(py "d['data']['id']"); PENDING+=("$P3")
-check "it waits" ingediend "$(py "a['status']")"
-FRESH="$A_NAME (A, fresh form)"
-check "A renames itself from a fresh form that shows ABB's name" 201 "$(stale_rename "$JA" "$A_ORG" "$FRESH" "$ABB_NAME")"
-NEWER=$(py "d['data']['id']")
-check "it is applied and replaces the waiting request" "goedgekeurd $P3" "$(py "a['status'] + ' ' + ','.join(a.get('superseded', []))")"
-check "the waiting request is withdrawn by the service, which names the newer one" "ingetrokken | 2 intrekking ingetrokken service None None superseded-by-own-request | Vervangen door wijzigingsaanvraag $NEWER" "$(fetch "$JA" "/change-requests/$P3" >/dev/null; py "a['status'] + ' | ' + steps().split(' | ')[1] + ' | ' + a['steps'][1]['reason']")"
-check "the waiting request names the newer one as dct:isReplacedBy, and so does the API" "True $NEWER" "$(ask "GRAPH <http://mu.semte.ch/graphs/change-requests> { ?old <${MU}uuid> \"$P3\" ; <${DCT}isReplacedBy> ?new . ?new <${MU}uuid> \"$NEWER\" }") $(fetch "$JA" "/change-requests/$P3" >/dev/null; py "a['replaced-by']")"
-check "the name is the fresh form's" "$FRESH" "$(name_of "$JA" "$A_ORG")"
+check "B cannot withdraw it: 403 (B sees it, but it is not B's)" 403 "$(take_step "$JB" "$P3" intrekking)"
+check "A withdraws it" 201 "$(take_step "$JA" "$P3" intrekking)"
+check "it is ingetrokken; the organisation never existed" "ingetrokken 404" "$(py "a['status']") $(code "$JA" "/administrative-units/$(python3 -c "import json; print(json.load(open('$TMP/body'))['data']['relationships']['target']['data']['id'])")")"
+check "an unknown step type: 422" 422 "$(take_step "$JA" "$P3" goedkeuren)"
 
-# --- ABB approves a request despite its conflict; the state the approval replaced keeps what it overwrote
-OVERRIDE="$A_NAME (A, approved over ABB's name)"
-check "A submits a rename from a form that still shows the first test name" 201 "$(stale_rename "$JA" "$A_ORG" "$OVERRIDE" "$NAME0")"
-P4=$(py "d['data']['id']"); PENDING+=("$P4")
-check "it waits with a conflict on the name" "ingediend administrative-units name: base $NAME0, current $FRESH, proposed $OVERRIDE, competing -" "$(py "a['status'] + ' ' + conflicts(a['conflicts'])")"
-P4_TOKEN=$(py "a['conflicts-token']")
-check "ABB approves it with the token of that conflict" 201 "$(take_step "$JABB" "$P4" goedkeuring "" "\"$P4_TOKEN\"")"
-check "the answer shows the conflict the approval overrode" "goedgekeurd True administrative-units name: base $NAME0, current $FRESH, proposed $OVERRIDE, competing -" "$(py "a['status'] + ' ' + str(a['steps'][1]['overrides-conflict']) + ' ' + conflicts([dict(c, **{'competing-requests': []}) for c in a['steps'][1]['overridden-conflicts']])")"
-check "read back, it is derived from the state the goedkeuring replaced" "True administrative-units name: base $NAME0, current $FRESH, proposed $OVERRIDE, competing -" "$(fetch "$JA" "/change-requests/$P4" >/dev/null; py "str(a['steps'][1]['overrides-conflict']) + ' ' + conflicts([dict(c, **{'competing-requests': []}) for c in a['steps'][1]['overridden-conflicts']])")"
-check "that state holds the name the approval overwrote" True "$(ask "GRAPH <http://mu.semte.ch/graphs/change-requests> { ?r <${MU}uuid> \"$P4\" . ?s a <${CR}Action> ; <${DCT}isPartOf> ?r ; <${PROV}invalidated> ?state . ?state a <${CR}RecordState> ; <http://www.w3.org/2004/02/skos/core#prefLabel> \"$FRESH\" }")"
-check "the name is the approved one" "$OVERRIDE" "$(name_of "$JA" "$A_ORG")"
-
-# B: only ABB decides, also on B's own request
-check "B submits a rename of itself from a stale form" 201 "$(stale_rename "$JB" "$B_ORG" "$B_NAME (B, test Lokale Verkenner)" "$B_NAME (old)")"
-PB=$(py "d['data']['id']"); PENDING+=("$PB")
-check "B's request waits" ingediend "$(py "a['status']")"
-check "B approves its own pending request: 403" 403 "$(take_step "$JB" "$PB" goedkeuring)"
-check "the 403 names no rule that allowed it" "null" "$(py "d['errors'][0]['meta']['rule']")"
-check "B rejects it: 403 as well" 403 "$(take_step "$JB" "$PB" afkeuring "zelf afgekeurd")"
-check "B cannot take a step on a request of A it cannot see: 404" 404 "$(take_step "$JB" "$P1" intrekking)"
-check "B withdraws its request" 201 "$(take_step "$JB" "$PB" intrekking)"
-check "B keeps its name" "$B_NAME" "$(name_of "$JB" "$B_ORG")"
-check "an unknown step type: 422" 422 "$(take_step "$JA" "$P2" goedkeuren)"
+# --- a veranderingsgebeurtenis: A registers a naamswijziging, ABB approves over a conflict ----------------
+EVENT_NAME="$A_NAME (na naamswijziging, test Lokale Verkenner)"
+check "A requests a naamswijziging about itself, with the besluit and the new name" 201 "$(post "$JA" /change-requests "$(change_event_body "$A_ORG" "$EVENT_NAME" "$ABB_NAME")")"
+EVENT_ID=$(py "d['data']['id']"); PENDING+=("$EVENT_ID"); remember_lids
+check "it waits: ingediend, kind change-event, no conflict" "ingediend change-event []" "$(py "a['status'] + ' ' + a['kind'] + ' ' + json.dumps(a['conflicts'])")"
+check "the name is unchanged meanwhile" "$ABB_NAME" "$(name_of "$JA" "$A_ORG")"
+check "B lists it among the requests about A" True "$(fetch "$JB" "/change-requests?filter[target]=$A_ORG&filter[kind]=change-event&filter[status]=ingediend" >/dev/null; py "'$EVENT_ID' in ids()")"
+FRESH="$A_NAME (ABB, intussen hernoemd)"
+check "ABB renames A while the request waits" 201 "$(rename "$JABB" "$A_ORG" "$FRESH")"
+check "the waiting request now shows a conflict on the name, computed live" "administrative-units name: base $ABB_NAME, current $FRESH, proposed $EVENT_NAME, competing -" "$(fetch "$JABB" "/change-requests/$EVENT_ID" >/dev/null; py "conflicts(a['conflicts'])")"
+TOKEN=$(py "a['conflicts-token']")
+check "ABB's approval without override: 409, the conflict re-checked" 409 "$(take_step "$JABB" "$EVENT_ID" goedkeuring)"
+check "the 409 carries the token GET shows" "$TOKEN" "$(py "d['errors'][0]['meta']['conflicts-token']")"
+check "approving with the token of other conflicts: 409, nothing applied" "409 $FRESH" "$(take_step "$JABB" "$EVENT_ID" goedkeuring "" '"0123abcd"') $(name_of "$JA" "$A_ORG")"
+check "override true is refused: it must be the token of the conflicts reviewed" 422 "$(take_step "$JABB" "$EVENT_ID" goedkeuring "" true)"
+check "ABB approves with the token of that conflict" 201 "$(take_step "$JABB" "$EVENT_ID" goedkeuring "" "\"$TOKEN\"")"
+check "the afhandeling shows the conflict it overrode" "afgehandeld True administrative-units name: base $ABB_NAME, current $FRESH, proposed $EVENT_NAME, competing -" "$(py "a['status'] + ' ' + str(a['steps'][-1]['overrides-conflict']) + ' ' + conflicts([dict(c, **{'competing-requests': []}) for c in a['steps'][-1]['overridden-conflicts']])")"
+check "read back, it is derived from the state the afhandeling replaced" "True" "$(fetch "$JA" "/change-requests/$EVENT_ID" >/dev/null; py "str(a['steps'][-1]['overrides-conflict'])")"
+check "that state holds the name the approval overwrote" True "$(ask "GRAPH <$CRG> { ?r <${MU}uuid> \"$EVENT_ID\" . ?s a <${CR}Action> ; <${DCT}isPartOf> ?r ; <${PROV}invalidated> ?state . ?state a <${CR}RecordState> ; <${SKOS}prefLabel> \"$FRESH\" }")"
+check "the name is the one of the naamswijziging" "$EVENT_NAME" "$(name_of "$JA" "$A_ORG")"
+check "the change event hangs off A in the public graph, with its type and the link to the besluit" True "$(ask "GRAPH <$PUBLIC> { ?o <${MU}uuid> \"$A_ORG\" . ?e a <${ORG}ChangeEvent> ; <${ORG}originalOrganization> ?o ; <${CH}typeWijziging> <http://lblod.data.gift/concepts/$NAAMSWIJZIGING> ; <http://data.europa.eu/m8g/hasFormalFramework> ?d . ?d <http://xmlns.com/foaf/0.1/page> ?link }")"
 
 # --- a new vestiging with address and contact point, linked to A (site aggregate) ------------------
 SITE="{\"data\":{\"type\":\"change-requests\",\"attributes\":{\"aggregate\":\"site\",\"operations\":[
@@ -235,9 +339,7 @@ SITE="{\"data\":{\"type\":\"change-requests\",\"attributes\":{\"aggregate\":\"si
  {\"op\":\"update\",\"data\":{\"type\":\"administrative-units\",\"id\":\"$A_ORG\",\"relationships\":{\"sites\":{\"data\":[{\"type\":\"sites\",\"lid\":\"s1\"}]}}}}
  ]},\"relationships\":{\"target\":{\"data\":{\"type\":\"organizations\",\"id\":\"$A_ORG\"}}}}}"
 check "A adds a vestiging with address and contact point" 201 "$(post "$JA" /change-requests "$SITE")"
-SITE_ID=$(python3 -c "import json; print(json.load(open('$TMP/body'))['data']['attributes']['lids']['s1'])" 2>/dev/null)
-ADDR_ID=$(python3 -c "import json; print(json.load(open('$TMP/body'))['data']['attributes']['lids']['a1'])" 2>/dev/null)
-CP_ID=$(python3 -c "import json; print(json.load(open('$TMP/body'))['data']['attributes']['lids']['c1'])" 2>/dev/null)
+SITE_ID=$(py "a['lids']['s1']"); ADDR_ID=$(py "a['lids']['a1']"); CP_ID=$(py "a['lids']['c1']")
 street=$(get "$JA" "/administrative-units/$A_ORG/sites?include=address" | python3 -c "import json,sys; d=json.load(sys.stdin); print(','.join(i['attributes'].get('street','') for i in d.get('included',[]) if i['type']=='addresses'))")
 check "the vestiging and its address are visible under A" "Grote Markt" "$street"
 
@@ -247,9 +349,9 @@ SITE2="{\"data\":{\"type\":\"change-requests\",\"attributes\":{\"aggregate\":\"s
  {\"op\":\"update\",\"data\":{\"type\":\"administrative-units\",\"id\":\"$A_ORG\",\"relationships\":{\"sites\":{\"data\":[{\"type\":\"sites\",\"lid\":\"s2\"}]}},\"meta\":{\"base\":{\"relationships\":{\"sites\":{\"data\":[]}}}}}}
  ]},\"relationships\":{\"target\":{\"data\":{\"type\":\"organizations\",\"id\":\"$A_ORG\"}}}}}"
 check "a page that loaded A without the first vestiging adds a second one" 201 "$(post "$JA" /change-requests "$SITE2")"
-check "it is applied without a conflict: the new vestiging is added to the sites, not put in their place" "goedgekeurd []" "$(py "a['status'] + ' ' + json.dumps(a['conflicts'])")"
+check "it is applied without a conflict: the new vestiging is added to the sites, not put in their place" "afgehandeld []" "$(py "a['status'] + ' ' + json.dumps(a['conflicts'])")"
 SITE2_ID=$(py "a['lids']['s2']")
-linked() { ask "GRAPH <http://mu.semte.ch/graphs/public> { ?o <http://mu.semte.ch/vocabularies/core/uuid> \"$A_ORG\" ; <http://www.w3.org/ns/org#hasSite> <http://data.lblod.info/id/vestigingen/$1> }"; }
+linked() { ask "GRAPH <$PUBLIC> { ?o <${MU}uuid> \"$A_ORG\" ; <${ORG}hasSite> <http://data.lblod.info/id/vestigingen/$1> }"; }
 check "A has both test vestigingen" "True True" "$(linked "$SITE_ID") $(linked "$SITE2_ID")"
 
 # a delete from a page that loaded another e-mail address than the contact point has now
@@ -257,24 +359,23 @@ STALE_DELETE="{\"data\":{\"type\":\"change-requests\",\"attributes\":{\"aggregat
  {\"op\":\"update\",\"data\":{\"type\":\"sites\",\"id\":\"$SITE_ID\",\"relationships\":{\"contacts\":{\"data\":[]}},\"meta\":{\"base\":{\"relationships\":{\"contacts\":{\"data\":[{\"type\":\"contact-points\",\"id\":\"$CP_ID\"}]}}}}}},
  {\"op\":\"delete\",\"data\":{\"type\":\"contact-points\",\"id\":\"$CP_ID\",\"meta\":{\"base\":{\"attributes\":{\"email\":\"oud@example.org\",\"type\":\"Primary\"}}}}}
  ]},\"relationships\":{\"target\":{\"data\":{\"type\":\"organizations\",\"id\":\"$A_ORG\"}}}}}"
-check "A deletes the contact point from a page that showed another e-mail address" 201 "$(post "$JA" /change-requests "$STALE_DELETE")"
-PD=$(py "d['data']['id']"); PENDING+=("$PD")
-check "the delete waits: the address changed since the page loaded it" "ingediend contact-points email: base oud@example.org, current loket@example.org, proposed None, competing -" "$(py "a['status'] + ' ' + conflicts(a['conflicts'])")"
-check "the tombstone's base state keeps the links to its master, as statements" True "$(ask "GRAPH <http://mu.semte.ch/graphs/change-requests> { ?r <${MU}uuid> \"$PD\" . ?s a <${CR}Action> ; <${DCT}isPartOf> ?r ; <${PROV}generated> ?v . ?v <${CR}operation> <https://www.w3.org/ns/activitystreams#Delete> ; <${CR}base> ?b . ?b <${CR}incomingLink> ?l . ?l a <${RDF}Statement> ; <${RDF}subject> <http://data.lblod.info/id/vestigingen/$SITE_ID> ; <${RDF}predicate> <http://www.w3.org/ns/org#siteAddress> }")"
-check "A withdraws it; the contact point stays" "201 True" "$(take_step "$JA" "$PD" intrekking) $(ask "?s <http://mu.semte.ch/vocabularies/core/uuid> \"$CP_ID\"")"
+check "A deletes the contact point from a page that showed another e-mail address: 409" 409 "$(post "$JA" /change-requests "$STALE_DELETE")"
+check "the conflict: the address changed since the page loaded it" "contact-points email: base oud@example.org, current loket@example.org, proposed None, competing -" "$(py "conflicts(d['errors'][0]['meta']['conflicts'])")"
+check "the contact point stays" True "$(ask "?s <${MU}uuid> \"$CP_ID\"")"
 
 # the records live in the right graphs
-check "requests, steps, versions, states and links are in the change-requests graph" True "$(ask "GRAPH <http://mu.semte.ch/graphs/change-requests> { ?r a <${CR}ChangeRequest> . ?s a <${CR}Action> ; <${DCT}isPartOf> ?r . ?v a <${CR}ProposedVersion> . ?b a <${CR}RecordState> . ?l a <${RDF}Statement> }")"
-check "no request, step, version, state or link leaks into the public graph" False "$(ask "GRAPH <http://mu.semte.ch/graphs/public> { ?r a ?t . VALUES ?t { <${CR}ChangeRequest> <${CR}ProposedVersion> <${CR}Action> <${CR}RecordState> <${RDF}Statement> <http://open-services.net/ns/core#Error> } }")"
-check "a request names its organisation (pav:createdBy) and the person who submitted it (dct:creator)" True "$(ask "GRAPH <http://mu.semte.ch/graphs/change-requests> { ?r <${MU}uuid> \"$P1\" ; <http://purl.org/pav/createdBy> ?org ; <${DCT}creator> ?person } GRAPH <http://mu.semte.ch/graphs/public> { ?org <${MU}uuid> \"$A_ORG\" . ?person a <http://xmlns.com/foaf/0.1/Person> ; <${MU}uuid> \"$A_PERSON\" }")"
-check "the versions of a request hang off its indiening step" True "$(ask "GRAPH <http://mu.semte.ch/graphs/change-requests> { ?r <${MU}uuid> \"$P1\" . ?s a <${CR}Action> ; <${DCT}isPartOf> ?r ; <http://schema.org/position> 1 ; <${PROV}generated> ?v . ?v <${CR}base> ?b . FILTER NOT EXISTS { ?v <${PROV}wasGeneratedBy> ?s } }")"
-check "A carries dct:modified and ext:lastModifiedBy, a person" True "$(ask "GRAPH <http://mu.semte.ch/graphs/public> { ?o <${MU}uuid> \"$A_ORG\" ; <${DCT}modified> ?m ; <http://mu.semte.ch/vocabularies/ext/lastModifiedBy> ?by . ?by a <http://xmlns.com/foaf/0.1/Person> }")"
+check "requests, steps, versions, states and links are in the change-requests graph" True "$(ask "GRAPH <$CRG> { ?r a <${CR}ChangeRequest> . ?s a <${CR}Action> ; <${DCT}isPartOf> ?r . ?v a <${CR}ProposedVersion> . ?b a <${CR}RecordState> }")"
+check "no request, step, version, state or link leaks into the public graph" False "$(ask "GRAPH <$PUBLIC> { ?r a ?t . VALUES ?t { <${CR}ChangeRequest> <${CR}ProposedVersion> <${CR}Action> <${CR}RecordState> <${RDF}Statement> <http://open-services.net/ns/core#Error> } }")"
+check "a request names its organisation (pav:createdBy) and the person who submitted it (dct:creator)" True "$(ask "GRAPH <$CRG> { ?r <${MU}uuid> \"$CREATE_ID\" ; <http://purl.org/pav/createdBy> ?org ; <${DCT}creator> ?person } GRAPH <$PUBLIC> { ?org <${MU}uuid> \"$A_ORG\" . ?person a <http://xmlns.com/foaf/0.1/Person> ; <${MU}uuid> \"$A_PERSON\" }")"
+check "the versions of a request hang off its indiening step; the question, answer, rejection and contest are on their steps" True "$(ask "GRAPH <$CRG> { ?r <${MU}uuid> \"$CREATE_ID\" . ?s a <${CR}Action> ; <${DCT}isPartOf> ?r ; <http://schema.org/position> 1 ; <${PROV}generated> ?v . ?q <${DCT}isPartOf> ?r ; <http://schema.org/position> 2 ; <${DCT}description> \"$QUESTION\" . ?c <${DCT}isPartOf> ?r ; <http://schema.org/position> 5 ; <${DCT}description> \"$CONTEST\" }")"
+check "A carries dct:modified and ext:lastModifiedBy, a person" True "$(ask "GRAPH <$PUBLIC> { ?o <${MU}uuid> \"$A_ORG\" ; <${DCT}modified> ?m ; <http://mu.semte.ch/vocabularies/ext/lastModifiedBy> ?by . ?by a <http://xmlns.com/foaf/0.1/Person> }")"
 
 # --- put things back ----------------------------------------------------------------------------
 for id in "${PENDING[@]}"; do
-  if [ "$(fetch "$JABB" "/change-requests/$id")" = 200 ] && [ "$(py "a['status']")" = ingediend ]; then
-    take_step "$JABB" "$id" afkeuring "closed by the end-to-end script" >/dev/null
-    nok "request $id was still pending at the end; ABB closed it"
+  if [ "$(fetch "$JABB" "/change-requests/$id")" = 200 ]; then
+    case "$(py "a['status']")" in
+      ingediend|informatie-gevraagd) take_step "$JABB" "$id" afkeuring "closed by the end-to-end script" >/dev/null; nok "request $id was still pending at the end; ABB closed it" ;;
+    esac
   fi
 done
 check "ABB renames A back" 201 "$(rename "$JABB" "$A_ORG" "$A_NAME")"
@@ -290,10 +391,15 @@ UNSITE="{\"data\":{\"type\":\"change-requests\",\"attributes\":{\"aggregate\":\"
  {\"op\":\"delete\",\"data\":{\"type\":\"sites\",\"id\":\"$SITE2_ID\"}}
  ]},\"relationships\":{\"target\":{\"data\":{\"type\":\"organizations\",\"id\":\"$A_ORG\"}}}}}"
 check "A removes the test vestigingen again" 201 "$(post "$JA" /change-requests "$UNSITE")"
-check "the test vestigingen are gone" "False False" "$(ask "?s <http://mu.semte.ch/vocabularies/core/uuid> \"$SITE_ID\"") $(ask "?s <http://mu.semte.ch/vocabularies/core/uuid> \"$SITE2_ID\"")"
-check "the history keeps its links to them: the deletes leave the versions alone" True "$(ask "GRAPH <http://mu.semte.ch/graphs/change-requests> { ?v a <${CR}ProposedVersion> ; <${CR}masterUuid> \"$A_ORG\" ; <http://www.w3.org/ns/org#hasSite> <http://data.lblod.info/id/vestigingen/$SITE2_ID> }")"
-check "and the states the removal replaced hold the vestigingen A had" True "$(ask "GRAPH <http://mu.semte.ch/graphs/change-requests> { ?state a <${CR}RecordState> ; <${DCT}isVersionOf> ?o ; <http://www.w3.org/ns/org#hasSite> <http://data.lblod.info/id/vestigingen/$SITE2_ID> . ?s <${PROV}invalidated> ?state } GRAPH <http://mu.semte.ch/graphs/public> { ?o <${MU}uuid> \"$A_ORG\" }")"
-check "no request of this run is left pending" 0 "$(fetch "$JABB" "/change-requests?filter[target]=$A_ORG&filter[status]=ingediend" >/dev/null; py "d['meta']['count']")"
+check "the test vestigingen are gone" "False False" "$(ask "?s <${MU}uuid> \"$SITE_ID\"") $(ask "?s <${MU}uuid> \"$SITE2_ID\"")"
+check "the history keeps its links to them: the deletes leave the versions alone" True "$(ask "GRAPH <$CRG> { ?v a <${CR}ProposedVersion> ; <${CR}masterUuid> \"$A_ORG\" ; <${ORG}hasSite> <http://data.lblod.info/id/vestigingen/$SITE2_ID> }")"
+check "and the states the removal replaced hold the vestigingen A had" True "$(ask "GRAPH <$CRG> { ?state a <${CR}RecordState> ; <${DCT}isVersionOf> ?o ; <${ORG}hasSite> <http://data.lblod.info/id/vestigingen/$SITE2_ID> . ?s <${PROV}invalidated> ?state } GRAPH <$PUBLIC> { ?o <${MU}uuid> \"$A_ORG\" }")"
+# The organisations this run registered and the change event it applied: out of the public graph
+# (mu-cl-resources may cache them for a while; the dev stack holds test data only).
+for id in "${CREATED[@]}"; do remove_record "$id"; done
+check "the registered organisations and the change event are removed from the public graph" "False False False" "$(ask "?s <${MU}uuid> \"$NEW_ORG\"") $(ask "?s <${MU}uuid> \"$ABB_NEW_ORG\"") $(ask "GRAPH <$PUBLIC> { ?o <${MU}uuid> \"$A_ORG\" . ?e <${ORG}originalOrganization> ?o ; <${DCT}description> \"Naamswijziging (test Lokale Verkenner)\" }")"
+for id in "${FIXTURES[@]}"; do sparql_update "DELETE WHERE { GRAPH <$PUBLIC> { <http://lblod.data.gift/concepts/$id> ?p ?o } }" >/dev/null; done
+check "no request of this run is left pending" 0 "$(fetch "$JABB" "/change-requests?filter[requester]=$A_ORG&filter[status]=ingediend,informatie-gevraagd&filter[created][gte]=$RUN_START" >/dev/null; py "d['meta']['count']")"
 
 echo; echo "$pass passed, $fail failed"
 rm -rf "$TMP"

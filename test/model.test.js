@@ -60,7 +60,11 @@ test('keeps the attribute type, the predicate, the target and the cardinality pe
     assert.equal(model.attribute('catalogs', 'release-date').type, 'datetime');
     assert.equal(model.attribute('distributions', 'byte-size').type, 'number');
   }
-  if (has('decisions')) assert.equal(model.attribute('decisions', 'document-link').type, 'url');
+  if (has('decisions')) {
+    // OP since OP-3925: document-links (uri-set); app-lokale-verkenner still: document-link (url)
+    const links = model.attribute('decisions', 'document-links') ?? model.attribute('decisions', 'document-link');
+    assert.ok(['uri-set', 'url'].includes(links.type), links.type);
+  }
   assert.deepEqual(model.relationship('organizations', 'sites'), {
     name: 'sites',
     predicate: `${NS.org}hasSite`,

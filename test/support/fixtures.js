@@ -73,6 +73,9 @@ export const IDS = {
   siteType: 'dcc01338-842c-4fbd-ba68-3ca6f3af975c',
   location: 'a2f6c8e0-4b1d-4e3f-9a5c-7e9b1d3f5a7c',
   statusCode: '63cc561de9188d64ba5840a42ae8f0d6',
+  ilvCode: '3a2649ef-7345-4d3a-8709-f89fc9b44f58',
+  oprichtingType: 'f0e2706a-3b64-4464-ad9c-4e65dc976288',
+  nameChangeType: '6651dc69b0ae8f7ff9974e8a23db1dec',
 };
 
 export const URIS = {
@@ -97,6 +100,9 @@ export const URIS = {
   siteType: `http://lblod.data.gift/concepts/${IDS.siteType}`,
   location: `http://data.lblod.info/id/werkingsgebieden/${IDS.location}`,
   statusCode: `http://lblod.data.gift/concepts/${IDS.statusCode}`,
+  ilvCode: `http://data.vlaanderen.be/id/concept/BestuurseenheidClassificatieCode/${IDS.ilvCode}`,
+  oprichtingType: `http://lblod.data.gift/concepts/${IDS.oprichtingType}`,
+  nameChangeType: `http://lblod.data.gift/concepts/${IDS.nameChangeType}`,
 };
 
 const organisationClasses = [`${NS.besluit}Bestuurseenheid`, `${NS.org}Organization`, `${NS.dct}Agent`];
@@ -117,6 +123,9 @@ export const resources = new Map([
   [IDS.siteType, { uri: URIS.siteType, classes: [model.get('site-types').class] }],
   [IDS.location, { uri: URIS.location, classes: [model.get('locations').class] }],
   [IDS.statusCode, { uri: URIS.statusCode, classes: [model.get('organization-status-codes').class] }],
+  [IDS.ilvCode, { uri: URIS.ilvCode, classes: [model.get('administrative-unit-classification-codes').class] }],
+  [IDS.oprichtingType, { uri: URIS.oprichtingType, classes: [model.get('change-event-types').class] }],
+  [IDS.nameChangeType, { uri: URIS.nameChangeType, classes: [model.get('change-event-types').class] }],
 ]);
 
 /** The organisations findOrganisation can answer for. */
@@ -309,6 +318,64 @@ export const operations = [
     },
   },
   { op: 'delete', data: { type: 'contact-points', id: IDS.oldContact } },
+];
+
+/** The besluit links of a decision, under the model at hand: OP has document-links (uri-set), app-lokale-verkenner document-link. */
+export const decisionLinks = (links) => (model.attribute('decisions', 'document-links') ? { 'document-links': links } : { 'document-link': links[0] ?? null });
+
+/**
+ * A gemeente requests a new interlokale vereniging: the organisation with its KBO number, its
+ * primary site with an address, and the Oprichting change event with the besluit it rests on.
+ */
+export const creationOperations = () => [
+  {
+    op: 'create',
+    data: {
+      type: 'administrative-units',
+      lid: 'o1',
+      attributes: { name: 'ILV Denderland', 'legal-name': 'Interlokale vereniging Denderland' },
+      relationships: {
+        classification: { data: { type: 'administrative-unit-classification-codes', id: IDS.ilvCode } },
+        'organization-status': { data: { type: 'organization-status-codes', id: IDS.statusCode } },
+        identifiers: { data: [{ type: 'identifiers', lid: 'i1' }] },
+        'primary-site': { data: { type: 'sites', lid: 'v1' } },
+        sites: { data: [{ type: 'sites', lid: 'v1' }] },
+      },
+    },
+  },
+  { op: 'create', data: { type: 'identifiers', lid: 'i1', attributes: { 'id-name': 'KBO nummer' }, relationships: { 'structured-identifier': { data: { type: 'structured-identifiers', lid: 's1' } } } } },
+  { op: 'create', data: { type: 'structured-identifiers', lid: 's1', attributes: { 'local-id': '0123456789' } } },
+  { op: 'create', data: { type: 'sites', lid: 'v1', relationships: { address: { data: { type: 'addresses', lid: 'a1' } } } } },
+  { op: 'create', data: { type: 'addresses', lid: 'a1', attributes: { street: 'Grote Markt', number: '1', postcode: '9300', municipality: 'Aalst', country: 'België', 'full-address': 'Grote Markt 1, 9300 Aalst, België' } } },
+  {
+    op: 'create',
+    data: {
+      type: 'change-events',
+      lid: 'e1',
+      attributes: { date: '2026-10-01', description: 'Opgericht bij besluit van de gemeenteraad' },
+      relationships: { type: { data: { type: 'change-event-types', id: IDS.oprichtingType } }, 'original-organizations': { data: [{ type: 'administrative-units', lid: 'o1' }] }, decision: { data: { type: 'decisions', lid: 'd1' } } },
+    },
+  },
+  { op: 'create', data: { type: 'decisions', lid: 'd1', attributes: decisionLinks(['https://aalst.be/besluiten/2026/123']) } },
+];
+
+export const creationBody = (ops = creationOperations(), extra = {}) => ({
+  data: { type: 'change-requests', attributes: { aggregate: 'new-organisation', operations: ops, ...extra } },
+});
+
+/** Organisation A registers a change of name as a change event, with the besluit and the new name on itself. */
+export const changeEventOperations = (name = 'Stad Aalst') => [
+  {
+    op: 'create',
+    data: {
+      type: 'change-events',
+      lid: 'e1',
+      attributes: { date: '2026-10-01', description: 'Naamswijziging' },
+      relationships: { type: { data: { type: 'change-event-types', id: IDS.nameChangeType } }, 'original-organizations': { data: [{ type: 'administrative-units', id: IDS.org }] }, decision: { data: { type: 'decisions', lid: 'd1' } } },
+    },
+  },
+  { op: 'create', data: { type: 'decisions', lid: 'd1', attributes: decisionLinks(['https://aalst.be/besluiten/2026/124']) } },
+  { op: 'update', data: { type: 'administrative-units', id: IDS.org, attributes: { name }, meta: { base: { attributes: { name: 'Aalst' } } } } },
 ];
 
 export const body = (target = IDS.org, aggregate = 'organization-core-data', ops = operations) => ({

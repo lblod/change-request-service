@@ -27,13 +27,15 @@ console.log(
     `scope ${process.env.DEFAULT_MU_AUTH_SCOPE || '(none: set DEFAULT_MU_AUTH_SCOPE)'}; body limit ${bodyLimit}`,
 );
 
-// Before /change-requests/:id, or "permissions" would be taken for an id.
+// Before /change-requests/:id, or "permissions" would be taken for an id. With ?target= the
+// rights on that organisation; without, the rights of the session itself (which organisations
+// it may request, whether it decides).
 app.get('/change-requests/permissions', async (req, res, next) => {
   try {
     const session = await requireSession(db, req);
     const target = req.query.target;
-    if (typeof target !== 'string' || !target) {
-      throw new HttpError(400, 'Missing target', { detail: 'Pass the uuid of the organisation as ?target=' });
+    if (target !== undefined && (typeof target !== 'string' || !target)) {
+      throw new HttpError(400, 'Invalid target', { detail: 'Pass the uuid of the organisation as ?target=, or leave it out' });
     }
     res.status(200).json(await service.permissions(session, target));
   } catch (error) {
@@ -72,7 +74,8 @@ app.post('/change-requests', bodyParser.json({ type: 'application/json', limit: 
   }
 });
 
-// A step on an existing request: goedkeuring, afkeuring, intrekking or hertoepassing.
+// A step on an existing request: goedkeuring, afkeuring, informatievraag, informatieantwoord,
+// betwisting, intrekking or hertoepassing.
 app.post('/change-requests/:id/steps', bodyParser.json({ type: 'application/json', limit: bodyLimit }), async (req, res, next) => {
   try {
     const session = await requireSession(db, req);
