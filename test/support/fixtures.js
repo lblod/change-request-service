@@ -154,9 +154,9 @@ const masters = [URIS.org, URIS.orgB, URIS.abb, URIS.site, URIS.address, URIS.ol
 /**
  * What the masters hold before the fixture request, as currentTerms answers it ("<s> <p>" ->
  * bindings). Against it the request changes the house number, the full address and the address
- * register link of the address, the contacts and the site type of the site, the name, the sites
- * and the werkingsgebied of the organisation; it carries every other key as it is, so the
- * structured identifier ends up changing nothing.
+ * register link of the address, the contacts and the site type of the site, the name and the
+ * sites of the organisation; it carries every other key as it is (the werkingsgebied too, which
+ * the kerngegevens may not change), so the structured identifier ends up changing nothing.
  */
 export const masterState = () => ({
   // every master exists: currentTerms answers (master, rdf:type) with its classes
@@ -308,8 +308,8 @@ export const operations = [
         identifiers: { data: [{ type: 'identifiers', id: IDS.kboIdentifier }] },
         // outside the aggregate: carried as the page loaded it, unchanged
         classification: { data: { type: 'administrative-unit-classification-codes', id: IDS.gemeenteCode } },
-        // a reference: the werkingsgebied is cleared
-        scope: { data: null },
+        // read-only through the kerngegevens (it changes through a change event): carried as it is
+        scope: { data: { type: 'locations', id: IDS.location } },
         // inverse: the other record's state, ignored
         memberships: { data: [] },
       },

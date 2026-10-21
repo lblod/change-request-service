@@ -1,8 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createService, parseListQuery, pageLinks } from '../lib/change-requests.js';
+import { registrableClassifications } from '../lib/config.js';
 import { selectInBatches } from '../lib/sparql-result.js';
-import { STATUS, STEP_TYPE, OPERATION, SERVICE_AGENT, PENDING_STATUS_KEYS } from '../constants.js';
+import { STATUS, STEP_TYPE, OPERATION, SERVICE_AGENT, PENDING_STATUS_KEYS, PREFIXES, statusKey } from '../constants.js';
+import { parses } from './support/sparql.js';
 import {
   model,
   config,
@@ -69,8 +71,11 @@ const requestsMatching = (q, requests) => {
       (!statuses || statuses.includes(r.status)),
   );
 };
-const isApply = (q) => q.includes(`adms:status <${STATUS.afgehandeld}> .\n    <`);
+// An apply: an INSERT ... WHERE (the request insert, the steps, the statuses and the failure records are INSERT DATA).
+const isApply = (q) => q.includes('\nINSERT {');
 const PENDING = PENDING_STATUS_KEYS.map((key) => STATUS[key]);
+/** The """...""" strings of a query, in order. */
+const stringsOf = (q) => [...q.matchAll(/"""([^"]*)"""/g)].map((m) => m[1]);
 
 /**
  * A stand-in for the triplestore: it answers the service's queries from an in-memory state (the
@@ -78,16 +83,29 @@ const PENDING = PENDING_STATUS_KEYS.map((key) => STATUS[key]);
  * also tell what links to a record, records: uri -> { uuid, classes } of records that link to a
  * deleted one, requests and steps: rows of stored requests and their steps, storedVersions: rows
  * of their versions, replacedStates: rows of the states their steps replaced) and records the
- * updates. Every call yields once, so concurrent calls interleave as they would against a real
+ * updates. holders: KBO number -> { uri, uuid } of the organisation in the register that holds it;
+ * pendingKbo: KBO number -> { request, uuid, requestingOrganisation? } of the waiting creation that
+ * proposes it; identifierNames: structured identifier URI -> the name of its identifier in the
+ * register. Every call yields once, so concurrent calls interleave as they would against a real
  * store. failApply: how many apply attempts fail before one succeeds. onUpdate(q, state) lets a
- * test change the state the way an update would.
+ * test change the state the way an update would. Steps are read per request (VALUES ?request),
+ * as the service asks for them. Every query and update is parsed as SPARQL 1.1 first, so a
+ * malformed one fails the test that sends it.
  */
-function fakeDb({ failApply = 0, requests = [], steps = [], storedVersions = [], replacedStates = [], laterApplied = [], master = masterState(), records = {}, uuids = {}, former = {}, holders = {}, pendingKbo = {}, onUpdate } = {}) {
+function fakeDb({ failApply = 0, requests = [], steps = [], storedVersions = [], replacedStates = [], laterApplied = [], master = masterState(), records = {}, uuids = {}, former = {}, holders = {}, pendingKbo = {}, identifierNames = { [URIS.structuredKbo]: 'KBO nummer' }, onUpdate } = {}) {
   const state = { requests, steps, storedVersions, replacedStates, laterApplied, master };
   const updates = [];
   const queries = [];
   const log = [];
   let applyAttempts = 0;
+  // The versions of the waiting creations of pendingKbo, as the lookups of a KBO number find them.
+  const pendingEntries = Object.entries(pendingKbo).map(([localId, entry], n) => ({
+    localId,
+    ...entry,
+    structured: `http://example.org/pending/structured/${n}`,
+    structuredVersion: `http://example.org/pending/structured-version/${n}`,
+    identifierVersion: `http://example.org/pending/identifier-version/${n}`,
+  }));
   return {
     state,
     updates,
@@ -98,6 +116,7 @@ function fakeDb({ failApply = 0, requests = [], steps = [], storedVersions = [],
     },
     async query(q) {
       await tick();
+      parses(q);
       queries.push(q);
       log.push(['query', q]);
       if (q.includes('SELECT ?uri ?type ?classification')) {
@@ -107,7 +126,7 @@ function fakeDb({ failApply = 0, requests = [], steps = [], storedVersions = [],
         return bindings(organisation.classes.map((type) => ({ uri: organisation.uri, type, classification: organisation.classification })));
       }
       if (q.includes('SELECT ?uuid ?uri ?type')) {
-        const ids = [...q.matchAll(/"""([^"]+)"""/g)].map((m) => m[1]);
+        const ids = stringsOf(q);
         return bindings(ids.flatMap((uuid) => (resources.has(uuid) ? resources.get(uuid).classes.map((type) => ({ uuid, uri: resources.get(uuid).uri, type })) : [])));
       }
       if (q.includes('SELECT DISTINCT ?resource')) {
@@ -121,15 +140,46 @@ function fakeDb({ failApply = 0, requests = [], steps = [], storedVersions = [],
         const links = incomingMap(state.master);
         return { results: { bindings: pairsOf(q).flatMap(([o, p]) => (links.get(`${o} ${p}`) || []).map((s) => ({ o: uri(o), p: uri(p), s }))) } };
       }
-      if (q.includes('SELECT ?uri ?uuid\nWHERE')) {
-        // the organisation that holds an identifier (a KBO number)
-        const localId = [...q.matchAll(/"""([^"]+)"""/g)].at(-1)[1];
-        return bindings(holders[localId] ? [holders[localId]] : []);
+      if (q.includes('SELECT ?uri ?uuid\nWHERE {\n  VALUES ?localId')) {
+        // the organisation in the register that holds a KBO number, one of its forms
+        const except = q.match(/FILTER\(\?uri != <([^>]+)>\)/)?.[1];
+        const holder = stringsOf(q).map((localId) => holders[localId]).find(Boolean);
+        return bindings(holder && holder.uri !== except ? [holder] : []);
       }
-      if (q.includes('VALUES ?aggregate') && q.includes('?identifierVersion')) {
-        // the pending creations that propose a KBO number
-        const localId = [...q.matchAll(/"""([^"]+)"""/g)].at(-1)[1];
-        return bindings(pendingKbo[localId] ? [pendingKbo[localId]] : []);
+      if (q.includes('SELECT DISTINCT ?structuredVersion ?structured')) {
+        const forms = stringsOf(q);
+        return bindings(pendingEntries.filter((entry) => forms.includes(entry.localId)).map(({ structuredVersion, structured }) => ({ structuredVersion, structured })));
+      }
+      if (q.includes('SELECT DISTINCT ?identifierVersion ?idName')) {
+        const asked = pairsOf(q).map(([structured]) => structured);
+        return bindings(pendingEntries.filter((entry) => asked.includes(entry.structured)).map(({ identifierVersion }) => ({ identifierVersion, idName: 'KBO nummer' })));
+      }
+      if (q.includes('SELECT DISTINCT ?structured ?idName')) {
+        const asked = valuesOf(q, 'structured');
+        return bindings(asked.filter((structured) => identifierNames[structured]).map((structured) => ({ structured, idName: identifierNames[structured] })));
+      }
+      if (q.includes('SELECT DISTINCT ?version\nWHERE')) {
+        // the versions that change one of the pairs
+        const pairs = pairsOf(q).map(([m, p]) => `${m} ${p}`);
+        const found = new Set(
+          state.storedVersions.filter((row) => !row.base && row.p.value === `${NS.cr}changesProperty` && pairs.includes(`${row.master.value} ${row.o.value}`)).map((row) => row.version.value),
+        );
+        return bindings([...found].map((version) => ({ version })));
+      }
+      if (q.includes('SELECT DISTINCT ?version ?request ?uuid ?status ?aggregate ?requestingOrganisation')) {
+        const asked = valuesOf(q, 'version');
+        const found = [];
+        for (const version of asked) {
+          const pending = pendingEntries.find((entry) => entry.identifierVersion === version);
+          if (pending) {
+            found.push({ version, request: pending.request, uuid: pending.uuid, status: STATUS.ingediend, aggregate: 'new-organisation', requestingOrganisation: pending.requestingOrganisation ?? URIS.orgB });
+            continue;
+          }
+          const requestUri = state.storedVersions.find((row) => row.version.value === version)?.request.value;
+          const request = state.requests.find((r) => r.request === requestUri);
+          if (request) found.push({ version, request: request.request, uuid: request.uuid, status: request.status, aggregate: request.aggregate, requestingOrganisation: request.requestingOrganisation });
+        }
+        return bindings(found);
       }
       if (q.includes('SELECT DISTINCT ?request ?created')) {
         const descending = q.includes('ORDER BY DESC');
@@ -147,8 +197,9 @@ function fakeDb({ failApply = 0, requests = [], steps = [], storedVersions = [],
         }));
       }
       if (q.includes('SELECT DISTINCT ?request ?step ?stepUuid')) {
-        const visible = new Set(requestsMatching(q, state.requests).map((r) => r.request));
-        return bindings(state.steps.filter((step) => visible.has(step.request)));
+        // per request, as the service asks: by URI
+        const asked = valuesOf(q, 'request');
+        return bindings(state.steps.filter((step) => asked.includes(step.request)));
       }
       if (q.includes('SELECT ?request ?version ?master')) {
         const requested = valuesOf(q, 'request');
@@ -159,17 +210,6 @@ function fakeDb({ failApply = 0, requests = [], steps = [], storedVersions = [],
         return { results: { bindings: state.replacedStates.filter((row) => requested.includes(row.request.value)) } };
       }
       if (q.includes('SELECT DISTINCT ?request ?uuid ?appliedAt')) return bindings(state.laterApplied);
-      if (q.includes('SELECT DISTINCT ?request ?uuid\n')) {
-        // the pending requests whose stored versions replace one of the pairs
-        const pairs = pairsOf(q).map(([m, p]) => `${m} ${p}`);
-        const pending = new Map(state.requests.filter((r) => PENDING.includes(r.status)).map((r) => [r.request, r.uuid]));
-        const found = new Set(
-          state.storedVersions
-            .filter((row) => !row.base && row.p.value === `${NS.cr}changesProperty` && pending.has(row.request.value) && pairs.includes(`${row.master.value} ${row.o.value}`))
-            .map((row) => row.request.value),
-        );
-        return bindings([...found].map((request) => ({ request, uuid: pending.get(request) })));
-      }
       if (q.includes('SELECT DISTINCT ?uri ?uuid ?type')) {
         const asked = valuesOf(q, 'uri');
         return bindings(asked.filter((u) => records[u]).flatMap((u) => records[u].classes.map((type) => ({ uri: u, uuid: records[u].uuid, type }))));
@@ -179,13 +219,14 @@ function fakeDb({ failApply = 0, requests = [], steps = [], storedVersions = [],
         return bindings(asked.filter((u) => uuids[u]).map((u) => ({ uri: u, uuid: uuids[u] })));
       }
       if (q.includes('SELECT DISTINCT ?uuid ?uri')) {
-        const asked = [...q.matchAll(/"""([^"]+)"""/g)].map((m) => m[1]);
+        const asked = stringsOf(q);
         return bindings(asked.filter((id) => former[id]).map((id) => ({ uuid: id, uri: former[id] })));
       }
       throw new Error(`unexpected query: ${q}`);
     },
     async update(q) {
       await tick();
+      parses(q);
       updates.push(q);
       log.push(['update', q]);
       if (isApply(q) && applyAttempts++ < failApply) throw new Error('Virtuoso said no');
@@ -194,29 +235,52 @@ function fakeDb({ failApply = 0, requests = [], steps = [], storedVersions = [],
   };
 }
 
-/** onUpdate: keeps requests and steps in step with the step updates, as the triplestore would. */
-const recordSteps = (q, state) => {
-  const written = q.match(/<([^>]+)> adms:status <([^>]+)>(?: ;\n {6}dct:isReplacedBy <([^>]+)>)? \.\n {4}<([^>]+)> a cr:Action ;/);
-  if (!written) return;
-  const [, requestUri, status, replacedBy, stepUri] = written;
-  const field = (pattern) => q.match(pattern)?.[1];
-  const request = state.requests.find((r) => r.request === requestUri);
-  if (request) {
-    request.status = status;
-    if (replacedBy) Object.assign(request, { replacedBy, replacedByUuid: replacedBy.split('/').pop() });
-  }
-  state.steps = state.steps.filter((step) => step.step !== stepUri);
-  state.steps.push({
-    request: requestUri,
-    step: stepUri,
-    stepUuid: stepUri.split('/').pop(),
-    sequence: field(/schema:position "(\d+)"/),
-    type: field(/dct:type <([^>]+)>/),
-    status,
-    at: field(/prov:startedAtTime "([^"]+)"/),
-    agent: field(/prov:wasAssociatedWith <([^>]+)>/),
+/** The status a status update sets (statusQueries: INSERT DATA of adms:status), as [request, status], or null. */
+const statusSet = (q) => q.match(/INSERT DATA \{\n {2}GRAPH <[^>]+> \{ <([^>]+)> adms:status <([^>]+)> \. \}/)?.slice(1) ?? null;
+
+/** The steps an update writes: one per cr:Action block, with the fields the stepsQuery rows carry. */
+const stepsWritten = (q) =>
+  [...q.matchAll(/<([^>]+)> a cr:Action ;/g)].map((match) => {
+    const block = q.slice(match.index, q.indexOf(' .', q.indexOf('prov:wasAssociatedWith', match.index)));
+    const field = (pattern) => block.match(pattern)?.[1];
+    return {
+      request: field(/dct:isPartOf <([^>]+)>/),
+      step: match[1],
+      stepUuid: match[1].split('/').pop(),
+      sequence: field(/schema:position "(\d+)"/),
+      type: field(/dct:type <([^>]+)>/),
+      status: field(/adms:status <([^>]+)>/),
+      at: field(/prov:startedAtTime "([^"]+)"/),
+      agent: field(/prov:wasAssociatedWith <([^>]+)>/),
+    };
   });
+
+/** onUpdate: keeps requests and steps in step with the step and status updates, as the triplestore would. */
+const recordSteps = (q, state) => {
+  const removed = q.match(/DELETE \{\n {2}GRAPH <[^>]+> \{ <([^>]+)> \?p \?o \. \}/)?.[1];
+  if (removed) state.steps = state.steps.filter((step) => step.step !== removed);
+  for (const step of stepsWritten(q)) {
+    state.steps = state.steps.filter((other) => other.step !== step.step);
+    state.steps.push(step);
+  }
+  const replaced = q.match(/<([^>]+)> dct:isReplacedBy <([^>]+)> \./);
+  if (replaced) {
+    const request = state.requests.find((r) => r.request === replaced[1]);
+    if (request) Object.assign(request, { replacedBy: replaced[2], replacedByUuid: replaced[2].split('/').pop() });
+  }
+  const set = statusSet(q);
+  if (set) {
+    const request = state.requests.find((r) => r.request === set[0]);
+    if (request) request.status = set[1];
+  }
 };
+
+/** Whether an update only sets a status (statusQueries). */
+const isStatusUpdate = (q) => Boolean(statusSet(q)) || q.includes('adms:status ?other');
+/** The updates of a run other than the status updates: the writes of requests, steps and data. */
+const writes = (db) => db.updates.filter((q) => !isStatusUpdate(q));
+/** The statuses the updates of a run set, in order. */
+const statusesSet = (db) => db.updates.map(statusSet).filter(Boolean).map(([, status]) => statusKey(status));
 
 const clock = () => {
   const times = [NOW, APPLIED_AT];
@@ -224,9 +288,12 @@ const clock = () => {
   return () => times[Math.min(i++, times.length - 1)];
 };
 
-const service = (db) => createService({ model, config, db, mintUuid: uuidSequence(), clock: clock() });
+// verifyWrites: the fake does not keep the data an apply writes, so it cannot answer the read-back (tested on its own below).
+const service = (db) => createService({ model, config, db, mintUuid: uuidSequence(), clock: clock(), verifyWrites: false });
 
 const prefLabel = `${NS.skos}prefLabel`;
+const REQUEST_URI = (uuid) => `http://data.lblod.info/id/change-requests/${uuid}`;
+const PREFIX_LINES = PREFIXES;
 const withName = (name, state = masterState()) => ({ ...state, [`${URIS.org} ${prefLabel}`]: [literal(name)] });
 const rename = (name, base) => body(IDS.org, 'organization-core-data', [
   { op: 'update', data: { type: 'administrative-units', id: IDS.org, attributes: { name }, ...(base !== undefined ? { meta: { base: { attributes: { name: base } } } } : {}) } },
@@ -241,7 +308,7 @@ const serviceHandling = { sequence: 3, type: 'afhandeling', status: 'afgehandeld
 /** The attributes every document carries besides the flow: an edit the viewer submitted, about an organisation the fake shows no name or classification for. */
 const listed = { kind: 'edit', mine: true, 'target-name': null, 'target-classification': null };
 /** A service with the config changed: pendingVisibleTo "involved" for instance. */
-const configured = (db, overrides) => createService({ model, config: { ...config, ...overrides }, db, mintUuid: uuidSequence(), clock: clock() });
+const configured = (db, overrides) => createService({ model, config: { ...config, ...overrides }, db, mintUuid: uuidSequence(), clock: clock(), verifyWrites: false });
 
 // --- POST /change-requests ------------------------------------------------------------------
 
@@ -271,8 +338,11 @@ test('an organisation edits itself: the request with its indiening step and vers
     target: { data: { type: 'organizations', id: IDS.org } },
     'requesting-organisation': { data: { type: 'organizations', id: IDS.org } },
   });
-  assert.equal(db.updates.length, 2, 'the request insert and the apply');
-  const [insert, apply] = db.updates;
+  assert.equal(db.updates.length, 4, 'the request insert, the apply, and the status: the new one added, then the old one removed');
+  const [insert, apply, statusAdded, statusRemoved] = db.updates;
+  assert.ok(statusAdded.includes(`INSERT DATA {\n  GRAPH <http://mu.semte.ch/graphs/change-requests> { <${REQUEST_URI(sequenceUuid(1))}> adms:status <${STATUS.afgehandeld}> . }\n}`));
+  assert.ok(statusRemoved.includes(`FILTER(?other != <${STATUS.afgehandeld}>)`));
+  assert.ok(!apply.includes('adms:status ?'), 'the apply does not touch the request status');
   assert.ok(insert.includes('a cr:ChangeRequest') && insert.includes(`adms:status <${STATUS.ingediend}>`));
   assert.ok(insert.includes(`pav:createdBy <${URIS.org}> ;\n      dct:creator <${URIS.person}> .`), 'the organisation and the person, not the account');
   assert.ok(insert.includes(`dct:type <${STEP_TYPE.indiening}> ;\n      adms:status <${STATUS.ingediend}> ;\n      schema:position "1"^^xsd:integer ;`));
@@ -295,8 +365,9 @@ test('a failed apply is retried once; when the retry succeeds the request is afg
   assert.equal(status, 201);
   assert.equal(document.attributes.status, 'afgehandeld');
   assert.equal(db.applyAttempts, 2);
-  assert.equal(db.updates.length, 3, 'the insert and two apply attempts');
+  assert.equal(db.updates.length, 5, 'the insert, two apply attempts and the status');
   assert.equal(db.updates[1], db.updates[2], 'the same idempotent update');
+  assert.equal(statusSet(db.updates[3])[1], STATUS.afgehandeld, 'the status only once the apply went through');
 });
 
 test('when the retry fails too the afhandeling step is recorded as mislukt with the error after the goedkeuring, and the answer is 409', async () => {
@@ -307,13 +378,19 @@ test('when the retry fails too the afhandeling step is recorded as mislukt with 
     assert.deepEqual(error.meta, { 'change-request': { id: sequenceUuid(1), status: 'mislukt' } });
     return true;
   });
-  assert.equal(db.updates.length, 4);
-  const failure = db.updates[3];
-  assert.ok(failure.includes(`adms:status <${STATUS.mislukt}> .\n    <http://data.lblod.info/id/change-request-actions/`));
+  // the insert, two attempts, the failure record, the status (added, the old one removed), and the
+  // removal of whatever the attempts wrote of their step
+  assert.equal(db.updates.length, 7);
+  const [, attempt, , failure, statusAdded, , cleanup] = db.updates;
+  assert.ok(failure.startsWith(`${PREFIX_LINES}\n\nINSERT DATA {`), 'recorded without deleting anything');
   assert.ok(failure.includes(`dct:type <${STEP_TYPE.goedkeuring}> ;\n      adms:status <${STATUS.goedgekeurd}> ;\n      schema:position "2"^^xsd:integer ;`), 'the goedkeuring is kept');
   assert.ok(failure.includes(`dct:type <${STEP_TYPE.afhandeling}> ;\n      adms:status <${STATUS.mislukt}> ;\n      schema:position "3"^^xsd:integer ;`));
   assert.ok(failure.includes(`task:error <http://redpencil.data.gift/id/jobs/error/`));
   assert.ok(failure.includes(`a oslc:Error ;`) && failure.includes('oslc:message """Virtuoso said no"""') && failure.includes(`dct:creator <${SERVICE_AGENT}>`));
+  assert.equal(statusSet(statusAdded)[1], STATUS.mislukt);
+  const attempted = attempt.match(/<([^>]+)> a cr:Action ;\n {6}mu:uuid "{3}[^"]+"{3} ;\n {6}dct:isPartOf <[^>]+> ;\n {6}dct:type <[^>]+7f55ec41/)?.[1];
+  assert.ok(attempted && !failure.includes(`<${attempted}> a cr:Action`), 'the failure is recorded under a step of its own');
+  assert.ok(cleanup.includes(`{ <${attempted}> ?p ?o . }`), 'what the attempts wrote of their step is removed');
 });
 
 test('another organisation is refused with 403 and the policy outcome; nothing is written', async () => {
@@ -348,7 +425,7 @@ test('a relationship outside the aggregate passes when unchanged and is refused 
   const cleared = fakeDb();
   await assert.rejects(() => service(cleared).create(sessions.orgA, body(IDS.org, 'organization-core-data', withClassification(null))), {
     status: 422,
-    detail: 'relationship "classification" is not part of the aggregate "organization-core-data" and cannot be changed through it',
+    detail: 'relationship "classification" cannot be changed through the aggregate "organization-core-data"',
     pointer: '/data/attributes/operations/0/data/relationships/classification',
   });
   assert.equal(cleared.updates.length, 0);
@@ -358,6 +435,7 @@ test('ABB edits another organisation', async () => {
   const db = fakeDb();
   const { status, document } = await service(db).create(sessions.abb, body(IDS.orgB, 'site', [
     { op: 'create', data: { type: 'contact-points', lid: 'c1', attributes: { email: 'abb@example.org' } } },
+    { op: 'update', data: { type: 'sites', id: IDS.siteB, relationships: { contacts: { data: [{ type: 'contact-points', lid: 'c1' }] } } } },
   ]));
   assert.equal(status, 201);
   assert.equal(document.attributes.status, 'afgehandeld');
@@ -389,7 +467,10 @@ test('permissions answer with the deciding rule, the same evaluation as the POST
   assert.ok(gemeente['can-create'].includes(URIS.ilvCode));
   const abb = await service(fakeDb()).permissions(sessions.abb, undefined);
   assert.equal(abb['can-decide'], true);
-  assert.deepEqual(abb['can-create'], [...new Set(Object.values(config.creatableClassifications).flat())], 'every classification someone may request');
+  assert.deepEqual(abb['can-create'], registrableClassifications(config), 'every classification the service registers, as ABB may request any');
+  for (const onlyAbb of ['8392b885-a875-4b0d-b6a2-b52e53bda454', 'a3922c6d-425b-474f-9a02-ffb71a436bfc', '7a199d27-31c3-44bb-a58f-b3a64673a8b6']) {
+    assert.ok(abb['can-create'].some((uri) => uri.endsWith(onlyAbb)), `ABB registers ${onlyAbb}, which no other organisation may request`);
+  }
   assert.deepEqual((await service(fakeDb()).permissions({ ...sessions.orgA, actor: { ...sessions.orgA.actor, classification: null } }, undefined))['can-create'], []);
 });
 
@@ -421,18 +502,6 @@ test('the same stale form changing only another attribute applies that one and l
   const apply = db.updates[1];
   assert.ok(apply.includes(`<${URIS.org}> <${NS.regorg}legalName> """Stad Aalst""" .`));
   assert.ok(!apply.includes(prefLabel), 'the name is neither deleted nor written');
-});
-
-test('a request whose operations change nothing is recorded and approved like any other, with zero versions', async () => {
-  const db = fakeDb();
-  const { status, document } = await service(db).create(sessions.orgA, rename('Aalst'));
-  assert.equal(status, 201);
-  assert.equal(document.attributes.status, 'afgehandeld');
-  assert.equal(document.attributes.steps.length, 3);
-  const [insert, apply] = db.updates;
-  assert.ok(!insert.includes('cr:ProposedVersion') && !insert.includes('prov:generated'), 'no versions');
-  assert.ok(!apply.includes('http://mu.semte.ch/application'), 'nothing to apply, no dct:modified stamp');
-  assert.ok(apply.includes(`dct:type <${STEP_TYPE.goedkeuring}>`) && apply.includes(`dct:type <${STEP_TYPE.afhandeling}>`));
 });
 
 test('competing requests: other pending requests that write the same key with another value are listed, on the conflict and as competing', async () => {
@@ -505,12 +574,16 @@ test('a base may refer to a record deleted since: it is found through its versio
 const RID = (n) => testUuid('request', n);
 const SID = (n, sequence) => testUuid('step', n * 10 + sequence);
 const REQUEST = (n) => `http://data.lblod.info/id/change-requests/${RID(n)}`;
+/**
+ * A stored request n with a status: by default a change event about organisation A that A submitted,
+ * the kind that waits for ABB (an edit, aggregate organization-core-data, is applied at once).
+ */
 const requestRow = (n, status, extra = {}) => ({
   request: REQUEST(n),
   uuid: RID(n),
   created: '2026-11-03T10:12:00Z',
   status: STATUS[status],
-  aggregate: 'organization-core-data',
+  aggregate: 'change-event',
   target: URIS.org,
   targetUuid: IDS.org,
   requestingOrganisation: URIS.org,
@@ -578,13 +651,13 @@ const replacedState = (n, sequence, { master = URIS.org, values = [], number = n
 /** The stored rename of request n: base "Aalst", proposal "Aalst (A)". */
 const storedRename = (n, proposed = 'Aalst (A)', base = 'Aalst') => storedVersion(n, { keys: [{ predicate: prefLabel, proposed: [literal(proposed)], base: [literal(base)] }] });
 
-// A request ABB submitted about organisation A, approved at once.
-const abbRequest = requestRow(1, 'afgehandeld', { requestingOrganisation: URIS.abb, requestingOrganisationUuid: IDS.abb, creator: URIS.personAbb });
+// An edit ABB made of organisation A, applied at once: history, listed only when edits are asked for.
+const abbRequest = requestRow(1, 'afgehandeld', { aggregate: 'organization-core-data', requestingOrganisation: URIS.abb, requestingOrganisationUuid: IDS.abb, creator: URIS.personAbb });
 const abbSteps = { agent: URIS.personAbb, agentUuid: sessions.abb.personUuid, organisation: URIS.abb, organisationUuid: IDS.abb, rule: 'abb-edits-all' };
 
 test('a listed request shows its status, steps and organisations; the person who submitted it only to its organisation and ABB', async () => {
   const db = fakeDb({ requests: [abbRequest], steps: appliedTrail(1, abbSteps) });
-  const { documents: list, count } = await service(db).list(sessions.orgA, { target: IDS.org });
+  const { documents: list, count } = await service(db).list(sessions.orgA, { target: IDS.org, kinds: ['edit'] });
   assert.equal(list.length, 1);
   assert.equal(count, 1);
   assert.deepEqual(list[0].attributes, {
@@ -607,7 +680,7 @@ test('a listed request shows its status, steps and organisations; the person who
   });
   assert.deepEqual(list[0].relationships['requesting-organisation'].data, { type: 'organizations', id: IDS.abb });
   assert.deepEqual(list[0].relationships.target, { data: { type: 'organizations', id: IDS.org } }, 'the organisation exists: no pending flag');
-  const byAbb = (await service(db).list(sessions.abb, { target: IDS.org })).documents[0].attributes;
+  const byAbb = (await service(db).list(sessions.abb, { target: IDS.org, kinds: ['edit'] })).documents[0].attributes;
   assert.equal(byAbb.steps[0].person, sessions.abb.personUuid, 'ABB sees who submitted it');
   assert.equal(byAbb.mine, true);
   const failed = await service(fakeDb({ requests: [requestRow(2, 'mislukt')], steps: [stepRow(2, 1, 'indiening', 'ingediend'), stepRow(2, 2, 'goedkeuring', 'goedgekeurd', serviceStep), stepRow(2, 3, 'afhandeling', 'mislukt', { ...handlingStep, error: 'Virtuoso said no' })] })).get(sessions.orgA, RID(2));
@@ -615,7 +688,7 @@ test('a listed request shows its status, steps and organisations; the person who
   assert.equal(failed.attributes.status, 'mislukt');
 });
 
-test('everyone sees every request; with pendingVisibleTo "involved" an organisation sees its own, those about it and the applied ones, and ABB still all', async () => {
+test('everyone sees every request; with pendingVisibleTo "involved" an organisation sees its own, those about it and the decided ones, and ABB still all', async () => {
   const db = fakeDb({ requests: [abbRequest] });
   await service(db).list(sessions.orgA, { target: IDS.org });
   const pageQuery = db.queries.find((q) => q.includes('SELECT DISTINCT ?request ?created'));
@@ -626,9 +699,10 @@ test('everyone sees every request; with pendingVisibleTo "involved" an organisat
   }
   const involved = fakeDb({ requests: [abbRequest] });
   await configured(involved, { pendingVisibleTo: 'involved' }).list(sessions.orgB);
-  const filter = `FILTER(?target = <${URIS.orgB}> || ?requestingOrganisation = <${URIS.orgB}> || ?status IN (<${STATUS.afgehandeld}>))`;
+  const decided = ['goedgekeurd', 'afgehandeld', 'afgekeurd', 'ingetrokken', 'mislukt'].map((key) => `<${STATUS[key]}>`).join(', ');
+  const filter = `FILTER(?target = <${URIS.orgB}> || ?requestingOrganisation = <${URIS.orgB}> || ?status IN (${decided}))`;
   const selecting = (q) => q.includes('SELECT DISTINCT ?request ?created') || q.includes('SELECT (COUNT(DISTINCT ?request) AS ?count)');
-  assert.ok(involved.queries.filter(selecting).every((q) => q.includes(filter)), 'an organisation that is not involved sees applied requests only');
+  assert.ok(involved.queries.filter(selecting).every((q) => q.includes(filter)), 'an organisation that is not involved sees the decided requests only, not the waiting ones');
   const all = fakeDb({ requests: [abbRequest] });
   await configured(all, { pendingVisibleTo: 'involved' }).list(sessions.abb);
   assert.ok(all.queries.filter((q) => q.includes('?request a cr:ChangeRequest')).every((q) => !q.includes('FILTER')), 'ABB sees all, unfiltered');
@@ -745,8 +819,9 @@ test('ABB approves a pending request: its goedkeuring is recorded and the afhand
   assert.deepEqual(document.attributes.steps[1], userStep(sessions.abb, { sequence: 2, type: 'goedkeuring', status: 'goedgekeurd', rule: 'abb-decides-all', reason: 'In orde' }));
   assert.deepEqual(document.attributes.steps[2], serviceHandling, 'the service applied it a moment later');
   assert.equal(document.attributes['applied-at'], '2026-11-03T10:12:01.000Z');
-  assert.equal(db.updates.length, 1);
-  const apply = db.updates[0];
+  assert.equal(writes(db).length, 1);
+  assert.deepEqual(statusesSet(db), ['afgehandeld'], 'the status once the apply went through');
+  const apply = writes(db)[0];
   assert.ok(apply.includes(`<${URIS.org}> <${prefLabel}> """Aalst (A)""" .`), 'the stored proposal');
   assert.ok(apply.includes(`dct:type <${STEP_TYPE.goedkeuring}> ;\n      adms:status <${STATUS.goedgekeurd}> ;\n      schema:position "2"^^xsd:integer ;`));
   assert.ok(apply.includes(`prov:wasAssociatedWith <${URIS.personAbb}> ;\n      cr:actingOrganisation <${URIS.abb}> ;\n      cr:rule """abb-decides-all""" ;\n      dct:description """In orde""" .`));
@@ -842,9 +917,10 @@ test('ABB rejects a pending request with a reason (afkeuring); a rejection needs
   assert.equal(status, 201);
   assert.equal(document.attributes.status, 'afgekeurd');
   assert.deepEqual(document.attributes.steps[1], userStep(sessions.abb, { sequence: 2, type: 'afkeuring', status: 'afgekeurd', rule: 'abb-decides-all', reason: 'Het KBO-nummer hoort bij een andere organisatie' }));
-  assert.equal(db.updates.length, 1);
-  assert.ok(!db.updates[0].includes('http://mu.semte.ch/application'), 'nothing is applied');
-  assert.ok(db.updates[0].includes(`adms:status <${STATUS.afgekeurd}> .\n    <`) && db.updates[0].includes('dct:description """Het KBO-nummer hoort bij een andere organisatie"""'));
+  assert.equal(writes(db).length, 1);
+  assert.deepEqual(statusesSet(db), ['afgekeurd']);
+  assert.ok(!writes(db)[0].includes('http://mu.semte.ch/application'), 'nothing is applied');
+  assert.ok(writes(db)[0].includes(`dct:type <${STEP_TYPE.afkeuring}> ;\n      adms:status <${STATUS.afgekeurd}> ;`) && writes(db)[0].includes('dct:description """Het KBO-nummer hoort bij een andere organisatie"""'));
   for (const reason of [undefined, '', '   ']) {
     await assert.rejects(() => service(pendingDb()).addStep(sessions.abb, RID(5), step('afkeuring', reason === undefined ? {} : { reason })), { status: 422, detail: 'an afkeuring needs a reason', pointer: '/data/attributes/reason' });
   }
@@ -943,23 +1019,25 @@ test('a failed request is applied again from its stored versions (hertoepassing)
   assert.equal(document.id, RID(2));
   assert.equal(document.attributes.status, 'afgehandeld');
   assert.equal(document.attributes.error, null);
-  assert.deepEqual(document.attributes.steps.at(-1), userStep(sessions.orgA, { sequence: 4, type: 'hertoepassing', status: 'afgehandeld', rule: 'own-organisation' }));
-  assert.equal(db.updates.length, 1, 'the apply only');
-  assert.ok(db.updates[0].includes(`VALUES ?s { <${URIS.org}> }\n    VALUES ?p { <${prefLabel}> }`));
-  assert.ok(db.updates[0].includes(`dct:type <${STEP_TYPE.hertoepassing}>`) && !db.updates[0].includes(`dct:type <${STEP_TYPE.goedkeuring}>`), 'no new goedkeuring: it was approved before');
+  assert.deepEqual(document.attributes.steps.at(-1), userStep(sessions.orgA, { sequence: 4, type: 'hertoepassing', status: 'afgehandeld', rule: 'requesting-organisation' }));
+  assert.equal(writes(db).length, 1, 'the apply only, then its status');
+  assert.deepEqual(statusesSet(db), ['afgehandeld']);
+  assert.ok(writes(db)[0].includes(`VALUES ?s { <${URIS.org}> }\n    VALUES ?p { <${prefLabel}> }`));
+  assert.ok(writes(db)[0].includes(`dct:type <${STEP_TYPE.hertoepassing}>`) && !writes(db)[0].includes(`dct:type <${STEP_TYPE.goedkeuring}>`), 'no new goedkeuring: it was approved before');
   const later = db.queries.find((q) => q.includes('SELECT DISTINCT ?request ?uuid ?appliedAt'));
   assert.ok(later.includes(`cr:target <${URIS.org}>`) && later.includes(`FILTER(?request != <${REQUEST(2)}>)`));
   assert.ok(later.includes('FILTER(?appliedAt > "2026-11-03T10:13:00.000Z"^^xsd:dateTime)'), 'applied after the failed step');
   assert.equal((await service(failedDb()).addStep(sessions.orgA, RID(2), step('hertoepassing'))).status, 201, 'through /steps: 201');
 });
 
-test('applying again is refused for a request that did not fail, that is not visible, or that another organisation may not edit', async () => {
-  const approved = fakeDb({ requests: [abbRequest] });
+test('applying again is for ABB and the organisation that submitted the request, and only for one whose apply failed', async () => {
+  const approved = fakeDb({ requests: [requestRow(1, 'afgehandeld')], steps: appliedTrail(1) });
   await assert.rejects(() => service(approved).apply(sessions.orgA, RID(1)), { status: 409, detail: `Change request "${RID(1)}" has status afgehandeld, which is final; no hertoepassing can follow` });
-  await assert.rejects(() => service(failedDb()).apply(sessions.orgB, RID(2)), { status: 403 }, 'B sees it but may not edit A');
+  await assert.rejects(() => service(failedDb()).apply(sessions.orgB, RID(2)), { status: 403, detail: 'No rule allows it' }, 'B sees it but did not submit it');
+  // what decides is who submitted it, whatever its kind: a gemeente re-applies its own creation too
   const bySubmitter = failedDb();
   bySubmitter.state.requests[0] = { ...bySubmitter.state.requests[0], requestingOrganisation: URIS.orgB, requestingOrganisationUuid: IDS.orgB };
-  await assert.rejects(() => service(bySubmitter).apply(sessions.orgB, RID(2)), { status: 403 }, 'B submitted it (sees it) but may not edit A');
+  assert.equal((await service(bySubmitter).apply(sessions.orgB, RID(2))).status, 200, 'the organisation that submitted it may');
   assert.equal((await service(failedDb()).apply(sessions.abb, RID(2))).status, 200, 'ABB may');
 });
 
@@ -975,9 +1053,11 @@ test('applying again is refused when a request on the organisation was applied a
 test('a failed re-apply records the hertoepassing as mislukt and answers 409', async () => {
   const db = failedDb({ failApply: 2 });
   await assert.rejects(() => service(db).apply(sessions.orgA, RID(2)), { status: 409, meta: { 'change-request': { id: RID(2), status: 'mislukt' } } });
-  assert.equal(db.updates.length, 3, 'two attempts and the failure record');
-  assert.ok(db.updates[2].includes(`dct:type <${STEP_TYPE.hertoepassing}> ;\n      adms:status <${STATUS.mislukt}> ;\n      schema:position "4"^^xsd:integer ;`));
-  assert.ok(db.updates[2].includes('oslc:message """Virtuoso said no"""'));
+  assert.equal(writes(db).length, 4, 'two attempts, the failure record and the removal of what the attempts wrote of their step');
+  assert.deepEqual(statusesSet(db), ['mislukt']);
+  const failure = writes(db)[2];
+  assert.ok(failure.includes(`dct:type <${STEP_TYPE.hertoepassing}> ;\n      adms:status <${STATUS.mislukt}> ;\n      schema:position "4"^^xsd:integer ;`));
+  assert.ok(failure.includes('oslc:message """Virtuoso said no"""'));
 });
 
 // --- simultaneous requests ------------------------------------------------------------------------
@@ -1017,7 +1097,7 @@ test('two steps on the same request at once: the second sees the status the firs
   assert.equal(withdrawal.status, 'rejected');
   assert.equal(withdrawal.reason.status, 409);
   assert.match(withdrawal.reason.detail, /has status afgehandeld, which is final/);
-  assert.equal(db.updates.length, 1, 'one step written, sequence 2 only once');
+  assert.equal(writes(db).length, 1, 'one step written, sequence 2 only once');
 });
 
 // --- deletes, merges and competing requests ---------------------------------------------------------
@@ -1052,8 +1132,13 @@ test('a delete from a stale form: a value set on the record since the page loade
 });
 
 /** Pending request 5 deletes the old contact point; when it was submitted its email was e0 and only the site linked it. */
+// Only creations and change events wait for ABB, and neither deletes records today; a held aggregate of
+// the kind change-event over the site's records keeps the rules for a pending delete tested.
+const heldSites = { ...config.aggregates.site, kind: 'change-event', writable: undefined };
+const heldConfig = { aggregates: { ...config.aggregates, 'held-site': heldSites } };
 const pendingDelete = (master) =>
   pendingDb({
+    requests: [requestRow(5, 'ingediend', { aggregate: 'held-site' })],
     storedVersions: storedVersion(5, {
       operation: 'delete',
       master: URIS.oldContact,
@@ -1066,24 +1151,33 @@ const pendingDelete = (master) =>
     records: { [URIS.siteB]: { uuid: IDS.siteB, classes: [`${NS.org}Site`] } },
   });
 
-test('a pending delete is checked live: an edit or a new link made since it was submitted is a conflict before ABB approves it', async () => {
-  assert.deepEqual((await service(pendingDelete()).get(sessions.abb, RID(5))).attributes.conflicts, [], 'nothing changed since');
+test('a pending delete is checked live: an edit made since it was submitted is a conflict, a link from outside the organisation refuses it', async () => {
+  const held = (db) => configured(db, heldConfig);
+  assert.deepEqual((await held(pendingDelete()).get(sessions.abb, RID(5))).attributes.conflicts, [], 'nothing changed since');
   const edited = pendingDelete({ [`${URIS.oldContact} ${email}`]: [literal('e1@aalst.be')] });
-  await assert.rejects(() => service(edited).addStep(sessions.abb, RID(5), step('goedkeuring')), (error) => {
+  await assert.rejects(() => held(edited).addStep(sessions.abb, RID(5), step('goedkeuring')), (error) => {
     assert.equal(error.status, 409);
     assert.deepEqual(error.meta.conflicts.map(({ resource, key, base, current, proposed }) => [resource.id, key, base, current, proposed]), [[IDS.oldContact, 'email', 'e0@aalst.be', 'e1@aalst.be', null]]);
     return true;
   });
-  // another site links the contact point now: deleting it would take it from that site
+  // another organisation's site links the contact point now: shown as a conflict, and deleting it would take it
+  // from that site, so the delete is refused, also with the token
   const linked = pendingDelete(contactsOf(URIS.siteB, [URIS.oldContact]));
-  const shown = (await service(linked).get(sessions.abb, RID(5))).attributes;
+  const shown = (await held(linked).get(sessions.abb, RID(5))).attributes;
   assert.deepEqual(shown.conflicts, [
     { resource: { type: 'sites', id: IDS.siteB }, key: 'contacts', base: [], current: [{ type: 'contact-points', id: IDS.oldContact }], proposed: [], 'master-exists': true, 'competing-requests': [] },
   ]);
-  await assert.rejects(() => service(linked).addStep(sessions.abb, RID(5), step('goedkeuring')), { status: 409 });
-  const { document } = await service(linked).addStep(sessions.abb, RID(5), step('goedkeuring', { override: shown['conflicts-token'] }));
-  assert.equal(document.attributes.status, 'afgehandeld', 'ABB may still delete it, knowingly');
-  assert.ok(linked.updates[0].includes(`VALUES ?o { <${URIS.oldContact}> }`));
+  await assert.rejects(() => held(linked).addStep(sessions.abb, RID(5), step('goedkeuring', { override: shown['conflicts-token'] })), {
+    status: 409,
+    title: 'The record is used outside the organisation',
+    detail: `contact-points "${IDS.oldContact}" is linked from ${URIS.siteB}, which does not belong to the organisation; deleting it would change that record too`,
+  });
+  assert.equal(linked.updates.length, 0, 'nothing applied');
+  // a link from the organisation's own site is part of what the delete removes
+  const own = pendingDelete();
+  const { document } = await held(own).addStep(sessions.abb, RID(5), step('goedkeuring'));
+  assert.equal(document.attributes.status, 'afgehandeld');
+  assert.ok(writes(own)[0].includes(`VALUES ?o { <${URIS.oldContact}> }`));
 });
 
 /** onUpdate: an apply adds the sites it links to the organisation, as the triplestore would. */
@@ -1131,9 +1225,10 @@ test('a newer request of the same organisation that rewrites every key of its ol
   assert.deepEqual(document.attributes.conflicts, []);
   assert.deepEqual(document.attributes.superseded, [RID(5)]);
   assert.deepEqual(document.attributes.competing, [], 'the replaced request no longer competes');
-  const withdrawal = db.updates.at(-1);
+  const withdrawal = writes(db).at(-1);
   assert.ok(withdrawal.includes(`dct:type <${STEP_TYPE.intrekking}> ;\n      adms:status <${STATUS.ingetrokken}> ;\n      schema:position "2"^^xsd:integer ;`), withdrawal);
-  assert.ok(withdrawal.includes(`<${REQUEST(5)}> adms:status <${STATUS.ingetrokken}> ;\n      dct:isReplacedBy <http://data.lblod.info/id/change-requests/${document.id}> .`), 'the older request names the newer one');
+  assert.ok(withdrawal.includes(`<${REQUEST(5)}> dct:isReplacedBy <http://data.lblod.info/id/change-requests/${document.id}> .`), 'the older request names the newer one');
+  assert.deepEqual(statusSet(db.updates.at(-2)), [REQUEST(5), STATUS.ingetrokken], 'then its status');
   assert.ok(
     withdrawal.includes(
       `prov:wasAssociatedWith <${SERVICE_AGENT}> ;\n      cr:rule """superseded-by-own-request""" ;\n      dct:description """Vervangen door wijzigingsaanvraag ${document.id}""" .`,
@@ -1251,7 +1346,7 @@ test('a gemeente requests a new interlokale vereniging: the organisation is mint
   assert.equal(document.attributes['target-name'], 'ILV Denderland', 'the answer shows what the request proposes, as the listing does');
   assert.equal(document.attributes['target-classification'], IDS.ilvCode);
   assert.deepEqual(document.attributes.steps, [userStep(sessions.orgA, { sequence: 1, type: 'indiening', status: 'ingediend', rule: 'may-create-classification', reason: 'Het besluit staat op de website' })]);
-  assert.deepEqual(document.relationships.target, { data: { type: 'organizations', id: sequenceUuid(1) }, meta: { pending: true } }, 'the organisation is minted first, before the request');
+  assert.deepEqual(document.relationships.target, { data: { type: 'organizations', id: sequenceUuid(1) }, meta: { registered: false, pending: true } }, 'the organisation is minted first, before the request');
   assert.equal(document.id, sequenceUuid(2));
   assert.deepEqual(document.attributes.lids, { o1: sequenceUuid(1), i1: sequenceUuid(3), s1: sequenceUuid(4), v1: sequenceUuid(5), a1: sequenceUuid(6), e1: sequenceUuid(7), d1: sequenceUuid(8) });
   assert.equal(db.updates.length, 1, 'the insert only: it waits for ABB');
@@ -1264,7 +1359,12 @@ test('a gemeente requests a new interlokale vereniging: the organisation is mint
   assert.ok(!insert.includes('http://mu.semte.ch/application'), 'nothing in the register');
   const holderQuery = db.queries.find((q) => q.includes('SELECT ?uri ?uuid\nWHERE') && q.includes('"""0123456789"""'));
   assert.ok(holderQuery, 'the KBO number was checked');
-  assert.ok(holderQuery.includes('?uri a ?type') && holderQuery.includes('<http://www.w3.org/ns/org#Organization>'), 'against organisations only: a proposed version carries the identifier predicate too');
+  assert.ok(holderQuery.includes('a ?type .') && holderQuery.includes('<http://www.w3.org/ns/org#Organization>'), 'against organisations only: a proposed version carries the identifier predicate too');
+  assert.ok(holderQuery.indexOf('VALUES ?localId') < holderQuery.indexOf('?identifier'), 'anchored on the number, in the forms it may be stored in');
+  assert.ok(holderQuery.includes('"""0123.456.789"""') && holderQuery.includes('"""BE0123456789"""'));
+  assert.ok(holderQuery.includes('FILTER(LCASE(STR(?idName)) IN ("""kbo nummer"""'), 'under any spelling of its name');
+  if (model.has('kbo-organizations')) assert.ok(holderQuery.includes(`FILTER NOT EXISTS { ?uri a <${model.get('kbo-organizations').class}> . }`), 'a KBO mirror holds no number of its own');
+  assert.ok(holderQuery.includes(`FILTER(?uri != <${organisation}>)`), 'the organisation it registers is not a holder');
 });
 
 test('a creation is refused when the KBO number is registered already, or proposed by a request that waits', async () => {
@@ -1338,7 +1438,7 @@ test('a creation that waits is listed with the organisation it proposes, and its
   const { documents: list } = await service(db).list(sessions.orgB, { kinds: ['creation'] });
   assert.equal(list.length, 1);
   assert.equal(list[0].attributes.kind, 'creation');
-  assert.deepEqual(list[0].relationships.target, { data: { type: 'organizations', id: testUuid('version', 905) }, meta: { pending: true } }, 'the uuid from the proposed version');
+  assert.deepEqual(list[0].relationships.target, { data: { type: 'organizations', id: testUuid('version', 905) }, meta: { registered: false, pending: true } }, 'the uuid from the proposed version');
   assert.equal(list[0].attributes.mine, false);
   assert.ok(db.queries.some((q) => q.includes('VALUES ?aggregate { """new-organisation""" }')), 'filtered on the aggregates of the kind');
   const detail = await service(db).get(sessions.orgA, RID(5));
@@ -1413,7 +1513,7 @@ test('a third party sees a request without the person who submitted it and witho
 });
 
 test('the listing filters on the kind, the person (mine), the requester, the classification and the time', async () => {
-  const requests = [requestRow(1, 'afgehandeld'), requestRow(2, 'ingediend', { aggregate: 'new-organisation', creator: URIS.personB, requestingOrganisation: URIS.orgB, requestingOrganisationUuid: IDS.orgB, created: '2026-10-05T10:00:00Z' })];
+  const requests = [requestRow(1, 'afgehandeld', { aggregate: 'organization-core-data' }), requestRow(2, 'ingediend', { aggregate: 'new-organisation', creator: URIS.personB, requestingOrganisation: URIS.orgB, requestingOrganisationUuid: IDS.orgB, created: '2026-10-05T10:00:00Z' })];
   const db = fakeDb({ requests });
   const ids = async (query) => (await service(db).list(sessions.abb, query)).documents.map((d) => d.id);
   assert.deepEqual(await ids({ kinds: ['edit'] }), [RID(1)]);
@@ -1423,7 +1523,342 @@ test('the listing filters on the kind, the person (mine), the requester, the cla
   assert.deepEqual(await ids({ requester: IDS.orgB }), [RID(2)]);
   assert.deepEqual(await ids({ requester: 'ffffffff-ffff-4fff-8fff-ffffffffffff' }), [], 'an unknown requester');
   assert.deepEqual(await ids({ created: { from: '2026-10-01T00:00:00.000Z', until: '2026-10-31T00:00:00.000Z' } }), [RID(2)]);
-  assert.deepEqual(await ids({ targetClassification: IDS.ilvCode }), [RID(2), RID(1)], 'oldest first; the fake does not join classifications, the query does');
+  assert.deepEqual(await ids({ targetClassification: IDS.ilvCode, kinds: ['edit', 'creation'] }), [RID(2), RID(1)], 'oldest first; the fake does not join classifications, the query does');
   assert.ok(db.queries.some((q) => q.includes(`FILTER(?classification = <${URIS.ilvCode}>)`)));
   assert.deepEqual(await ids({ targetClassification: 'ffffffff-ffff-4fff-8fff-ffffffffffff' }), [], 'an unknown classification');
+});
+
+// --- KBO numbers, what a request registers, statuses, visibility and limits ------------------------
+
+/** A waiting creation (request n) that proposes a KBO number: the organisation, its identifier and the structured identifier. */
+const pendingKboCreation = (n, number, options = {}) => {
+  const { db: base } = pendingCreation(n);
+  const identifier = `http://data.lblod.info/id/identificatoren/${testUuid('version', 950 + n)}`;
+  const structured = `http://data.lblod.info/id/gestructureerdeIdentificatoren/${testUuid('version', 960 + n)}`;
+  const created = (rows) => rows.filter((row) => !row.base && row.p.value !== `${NS.cr}base` && row.p.value !== `${NS.cr}changesProperty`);
+  const storedVersions = [
+    ...base.state.storedVersions,
+    ...created(storedVersion(n, { operation: 'create', type: 'identifiers', master: identifier, masterUuid: testUuid('version', 950 + n), number: 950 + n, keys: [{ predicate: `${NS.skos}notation`, proposed: [literal('KBO nummer')] }, { predicate: `${NS.generiek}gestructureerdeIdentificator`, proposed: [uri(structured)] }] })),
+    ...created(storedVersion(n, { operation: 'create', type: 'structured-identifiers', master: structured, masterUuid: testUuid('version', 960 + n), number: 960 + n, keys: [{ predicate: `${NS.generiek}lokaleIdentificator`, proposed: [literal(number)] }] })),
+  ];
+  return fakeDb({ requests: base.state.requests, steps: base.state.steps, storedVersions, uuids: { [URIS.ilvCode]: IDS.ilvCode }, onUpdate: recordSteps, ...options });
+};
+const kboOperations = (localId, idName = 'KBO nummer') => {
+  const ops = creationOperations();
+  ops[1].data.attributes['id-name'] = idName;
+  ops[2].data.attributes['local-id'] = localId;
+  return ops;
+};
+
+test('a KBO number is kept as its ten digits: dots, spaces and BE go, nine digits get their 0, anything else is a 422; its identifier is named "KBO nummer"', async () => {
+  for (const [given, stored] of [['0123.456.789', '0123456789'], ['BE 0123 456 789', '0123456789'], ['123456789', '0123456789']]) {
+    const db = fakeDb();
+    assert.equal((await service(db).create(sessions.orgA, creationBody(kboOperations(given)))).status, 201, given);
+    assert.ok(db.updates[0].includes(`<${NS.generiek}lokaleIdentificator> """${stored}"""`), `${given} is stored as ${stored}`);
+  }
+  await assert.rejects(() => service(fakeDb()).create(sessions.orgA, creationBody(kboOperations('12345'))), { status: 422, detail: 'a KBO number has ten digits (0123456789 or 0123.456.789)', pointer: '/data/attributes/operations/2/data/attributes/local-id' });
+  await assert.rejects(() => service(fakeDb()).create(sessions.orgA, creationBody(kboOperations('0123456789', 'KBO Nummer'))), { status: 422, detail: 'the identifier of a KBO number is named "KBO nummer"', pointer: '/data/attributes/operations/1/data/attributes/id-name' });
+});
+
+test('a creation needs a KBO number unless its classification registers without one (ILV, vervoerregioraad); one number only', async () => {
+  const withoutKbo = creationOperations().filter((operation) => !['identifiers', 'structured-identifiers'].includes(operation.data.type));
+  withoutKbo[0].data.relationships.identifiers = { data: [] };
+  assert.equal((await service(fakeDb()).create(sessions.orgA, creationBody(withoutKbo))).status, 201, 'an ILV may wait without one');
+  const agb = withoutKbo.map((operation) => structuredClone(operation));
+  agb[0].data.relationships.classification.data.id = '36a82ba0-7ff1-4697-a9dd-2e94df73b721';
+  const agbResources = { [agb[0].data.relationships.classification.data.id]: 'http://data.vlaanderen.be/id/concept/BestuurseenheidClassificatieCode/36a82ba0-7ff1-4697-a9dd-2e94df73b721' };
+  resources.set('36a82ba0-7ff1-4697-a9dd-2e94df73b721', { uri: agbResources['36a82ba0-7ff1-4697-a9dd-2e94df73b721'], classes: [model.get('administrative-unit-classification-codes').class] });
+  try {
+    await assert.rejects(() => service(fakeDb()).create(sessions.orgA, creationBody(agb)), { status: 422, detail: 'an organisation of this classification is registered with its KBO number (an identifier "KBO nummer")' });
+  } finally {
+    resources.delete('36a82ba0-7ff1-4697-a9dd-2e94df73b721');
+  }
+  const two = creationOperations();
+  two[0].data.relationships.identifiers.data.push({ type: 'identifiers', lid: 'i2' });
+  two.push({ op: 'create', data: { type: 'identifiers', lid: 'i2', attributes: { 'id-name': 'KBO nummer' }, relationships: { 'structured-identifier': { data: { type: 'structured-identifiers', lid: 's2' } } } } });
+  two.push({ op: 'create', data: { type: 'structured-identifiers', lid: 's2', attributes: { 'local-id': '0987654321' } } });
+  await assert.rejects(() => service(fakeDb()).create(sessions.orgA, creationBody(two)), { status: 422, detail: 'an organisation has one KBO number' });
+});
+
+test('an edit that changes the KBO number is checked like a creation; one that carries its own number as it is, is not', async () => {
+  const kboEdit = (localId) => body(IDS.org, 'organization-core-data', [{ op: 'update', data: { type: 'structured-identifiers', id: IDS.structuredKbo, attributes: { 'local-id': localId } } }]);
+  // the number the organisation has, carried as it is: no lookup, even if another record held it
+  const own = fakeDb({ holders: { '0207437468': { uri: URIS.orgB, uuid: IDS.orgB } } });
+  assert.equal((await service(own).create(sessions.orgA, kboEdit('0207.437.468'))).status, 201, 'normalised, it is what the organisation holds: nothing to check');
+  assert.ok(!own.queries.some((q) => q.includes('VALUES ?localId')), 'no uniqueness lookup for a number the request does not write');
+  // a new number someone else holds
+  const taken = fakeDb({ holders: { '0123456789': { uri: URIS.orgB, uuid: IDS.orgB } } });
+  await assert.rejects(() => service(taken).create(sessions.orgA, kboEdit('0123456789')), { status: 409, meta: { 'kbo-number': '0123456789', organisation: { type: 'organizations', id: IDS.orgB } }, pointer: '/data/attributes/operations/0/data/attributes/local-id' });
+  assert.equal(taken.updates.length, 0);
+  // the register says which structured identifier is a KBO number when its identifier is not in the request
+  assert.ok(taken.queries.some((q) => q.includes('SELECT DISTINCT ?structured ?idName') && q.includes(URIS.structuredKbo)));
+  const free = fakeDb();
+  assert.equal((await service(free).create(sessions.orgA, kboEdit('0123456789'))).status, 201);
+});
+
+test('two creations with the same KBO number at once: the lock on the number lets the second see the first', async () => {
+  const db = fakeDb({ onUpdate: (q, state) => {
+    // the first creation, once written, waits with its number
+    if (q.includes('a cr:ChangeRequest ;')) Object.assign(pendingKbo, { '0123456789': { request: q.match(/<([^>]+)> a cr:ChangeRequest/)[1], uuid: 'first', requestingOrganisation: URIS.org } });
+    recordSteps(q, state);
+  } });
+  const pendingKbo = {};
+  const shared = service(db);
+  // the stand-in reads pendingKbo when it is created, so the second lookup goes through the onUpdate above
+  const lookups = [];
+  const query = db.query.bind(db);
+  db.query = async (q) => {
+    if (q.includes('SELECT DISTINCT ?structuredVersion ?structured')) lookups.push(Object.keys(pendingKbo).length);
+    if (q.includes('SELECT DISTINCT ?structuredVersion ?structured') && pendingKbo['0123456789']) {
+      return { results: { bindings: [{ structuredVersion: { type: 'uri', value: 'http://example.org/v' }, structured: { type: 'uri', value: 'http://example.org/s' } }] } };
+    }
+    if (q.includes('SELECT DISTINCT ?identifierVersion ?idName') && pendingKbo['0123456789']) {
+      return { results: { bindings: [{ identifierVersion: { type: 'uri', value: 'http://example.org/i' }, idName: { type: 'literal', value: 'KBO nummer' } }] } };
+    }
+    if (q.includes('SELECT DISTINCT ?version ?request ?uuid ?status ?aggregate ?requestingOrganisation') && pendingKbo['0123456789']) {
+      const entry = pendingKbo['0123456789'];
+      return { results: { bindings: [{ version: { type: 'uri', value: 'http://example.org/i' }, request: { type: 'uri', value: entry.request }, uuid: { type: 'literal', value: entry.uuid }, status: { type: 'uri', value: STATUS.ingediend }, aggregate: { type: 'literal', value: 'new-organisation' }, requestingOrganisation: { type: 'uri', value: URIS.org } }] } };
+    }
+    return query(q);
+  };
+  const [first, second] = await Promise.allSettled([shared.create(sessions.orgA, creationBody()), shared.create(sessions.orgA, creationBody())]);
+  assert.equal(first.status, 'fulfilled');
+  assert.equal(second.status, 'rejected');
+  assert.equal(second.reason.status, 409);
+  assert.deepEqual(lookups, [0, 1], 'the second looked after the first was written');
+});
+
+test('approving or re-applying a creation claims its KBO number again: refused when the register holds it by now', async () => {
+  const taken = { holders: { '0123456789': { uri: URIS.orgB, uuid: IDS.orgB } } };
+  const db = pendingKboCreation(5, '0123456789', taken);
+  await assert.rejects(() => service(db).addStep(sessions.abb, RID(5), step('goedkeuring')), {
+    status: 409,
+    title: 'An organisation with this KBO number is already registered',
+    meta: { 'kbo-number': '0123456789', organisation: { type: 'organizations', id: IDS.orgB } },
+  });
+  assert.equal(db.updates.length, 0, 'nothing applied');
+  const holderQuery = db.queries.find((q) => q.includes('VALUES ?localId') && q.includes('?uri'));
+  assert.ok(holderQuery.includes('FILTER(?uri != <http://data.lblod.info/id/bestuurseenheden/'), 'the organisation it registers is not a holder (a hertoepassing after a half apply)');
+  // free: approved and applied
+  const free = pendingKboCreation(5, '0123456789');
+  assert.equal((await service(free).addStep(sessions.abb, RID(5), step('goedkeuring'))).document.attributes.status, 'afgehandeld');
+  // a rejection does not keep the number: another creation may take it, and contesting the rejection is refused then
+  const rejected = pendingKboCreation(5, '0123456789', { pendingKbo: { '0123456789': { request: REQUEST(7), uuid: RID(7), requestingOrganisation: URIS.orgB } } });
+  rejected.state.requests[0].status = STATUS.afgekeurd;
+  rejected.state.steps.push(stepRow(5, 2, 'afkeuring', 'afgekeurd', abbSteps));
+  await assert.rejects(() => service(rejected).addStep(sessions.orgA, RID(5), step('betwisting', { reason: 'Het nummer is van ons' })), {
+    status: 409,
+    title: 'A request to register an organisation with this KBO number is already waiting',
+  });
+  const contested = pendingKboCreation(5, '0123456789');
+  contested.state.requests[0].status = STATUS.afgekeurd;
+  contested.state.steps.push(stepRow(5, 2, 'afkeuring', 'afgekeurd', abbSteps));
+  assert.equal((await service(contested).addStep(sessions.orgA, RID(5), step('betwisting', { reason: 'Het nummer is van ons' }))).document.attributes.status, 'ingediend');
+});
+
+test('while waiting requests are for the involved, the KBO 409 names a waiting request only to who may see it', async () => {
+  const waiting = { pendingKbo: { '0123456789': { request: REQUEST(7), uuid: RID(7), requestingOrganisation: URIS.orgB } } };
+  await assert.rejects(() => configured(fakeDb(waiting), { pendingVisibleTo: 'involved' }).create(sessions.orgA, creationBody()), (error) => {
+    assert.equal(error.status, 409);
+    assert.deepEqual(error.meta, { 'kbo-number': '0123456789' }, 'B filed it; A may not see it');
+    assert.doesNotMatch(error.detail, new RegExp(RID(7)));
+    return true;
+  });
+  await assert.rejects(() => service(fakeDb(waiting)).create(sessions.orgA, creationBody()), { status: 409, meta: { 'kbo-number': '0123456789', 'change-request': { id: RID(7) } } }, 'everyone sees every request: named');
+});
+
+test('a creation registers what the service registers, as the type it registers it as, with exactly one oprichting', async () => {
+  const unregistered = creationOperations();
+  unregistered[0].data.relationships.classification.data.id = IDS.gemeenteCode;
+  await assert.rejects(() => service(fakeDb()).create(sessions.abb, creationBody(unregistered.map((operation, index) => (index === 0 ? { ...operation, data: { ...operation.data, relationships: { ...operation.data.relationships, classification: { data: { type: 'organization-classification-codes', id: IDS.siteType } } } } } : operation)))), {
+    status: 422,
+    detail: `the service does not register organisations of the classification "${IDS.siteType}"`,
+  });
+  const asRegistered = creationOperations();
+  asRegistered[0].data.type = 'registered-organizations';
+  await assert.rejects(() => service(fakeDb()).create(sessions.abb, creationBody(asRegistered)), { status: 422, detail: 'an organisation of this classification is registered as administrative-units, not as registered-organizations', pointer: '/data/attributes/operations/0/data/type' });
+  const noEvent = creationOperations().filter((operation) => !['change-events', 'decisions'].includes(operation.data.type));
+  await assert.rejects(() => service(fakeDb()).create(sessions.abb, creationBody(noEvent)), { status: 422, detail: /exactly one change event, its oprichting .*got 0/ });
+  const otherEvent = creationOperations();
+  otherEvent[5].data.relationships.type.data.id = IDS.nameChangeType;
+  await assert.rejects(() => service(fakeDb()).create(sessions.abb, creationBody(otherEvent)), { status: 422, detail: /exactly one change event, its oprichting/ });
+});
+
+test('a change-event request carries exactly one change event, about the organisation it is about', async () => {
+  assert.equal((await service(fakeDb()).create(sessions.orgA, body(IDS.org, 'change-event', changeEventOperations()))).status, 201);
+  const none = changeEventOperations().filter((operation) => !['change-events', 'decisions'].includes(operation.data.type));
+  await assert.rejects(() => service(fakeDb()).create(sessions.orgA, body(IDS.org, 'change-event', none)), { status: 422, detail: 'a change-event request carries exactly one change event, got 0' });
+  const elsewhere = changeEventOperations();
+  elsewhere[0].data.relationships['original-organizations'].data = [];
+  elsewhere[0].data.relationships.decision = { data: { type: 'decisions', lid: 'd1' } };
+  await assert.rejects(() => service(fakeDb()).create(sessions.orgA, body(IDS.org, 'change-event', elsewhere)), { status: 422 });
+});
+
+test('a step that leaves a request waiting answers with its live conflicts and token, as a GET does', async () => {
+  const db = pendingDb({ master: withName('Aalst (ABB)'), onUpdate: recordSteps });
+  const { document } = await service(db).addStep(sessions.abb, RID(5), step('informatievraag', { reason: 'Welk besluit?' }));
+  assert.equal(document.attributes.status, 'informatie-gevraagd');
+  assert.deepEqual(document.attributes.conflicts.map(({ key, current }) => [key, current]), [['name', 'Aalst (ABB)']]);
+  assert.equal(document.attributes['conflicts-token'], (await service(db).get(sessions.abb, RID(5))).attributes['conflicts-token']);
+});
+
+test('the status is the request\'s own; with two (a status update cut short) the one of its last step, with none the last step\'s', async () => {
+  const twice = pendingDb();
+  twice.state.requests.push({ ...twice.state.requests[0], status: STATUS.afgekeurd });
+  twice.state.steps.push(stepRow(5, 2, 'afkeuring', 'afgekeurd', abbSteps));
+  assert.equal((await service(twice).get(sessions.abb, RID(5))).attributes.status, 'afgekeurd');
+  const lost = pendingDb();
+  delete lost.state.requests[0].status;
+  assert.equal((await service(lost).get(sessions.abb, RID(5))).attributes.status, 'ingediend', 'found, although its status was lost');
+});
+
+test('a request whose organisation is gone can still be read and closed by ABB', async () => {
+  const db = pendingDb({ onUpdate: recordSteps });
+  db.state.requests[0] = { ...db.state.requests[0], target: 'http://data.lblod.info/id/bestuurseenheden/gone', targetUuid: undefined };
+  assert.equal((await service(db).get(sessions.abb, RID(5))).id, RID(5));
+  assert.equal((await service(db).addStep(sessions.abb, RID(5), step('afkeuring', { reason: 'De organisatie bestaat niet meer' }))).document.attributes.status, 'afgekeurd');
+});
+
+test('the target of a creation shows whether it waits; the error of a failed apply only to the organisation that submitted it and ABB', async () => {
+  const { db } = pendingCreation();
+  db.state.requests[0].status = STATUS.afgekeurd;
+  const rejected = await service(db).get(sessions.orgA, RID(5));
+  assert.deepEqual(rejected.relationships.target.meta, { registered: false, pending: false }, 'not registered, and no longer waiting');
+  const failed = failedDb();
+  assert.equal((await service(failed).get(sessions.orgA, RID(2))).attributes.error, 'Virtuoso said no');
+  const byB = (await service(failed).get(sessions.orgB, RID(2))).attributes;
+  assert.equal(byB.error, null, 'a third organisation sees that it failed, not why');
+  assert.equal(byB.steps.at(-1).error, null);
+});
+
+test('filter[target] also finds a waiting creation by the uuid it minted for its organisation', async () => {
+  const minted = testUuid('version', 905);
+  const { db, organisation } = pendingCreation(5, { former: { [minted]: `http://data.lblod.info/id/bestuurseenheden/${minted}` } });
+  const { documents } = await service(db).list(sessions.orgA, { target: minted });
+  assert.deepEqual(documents.map((document) => document.id), [RID(5)]);
+  assert.ok(db.queries.some((q) => q.includes(`FILTER(?target = <${organisation}>)`)));
+});
+
+test('a delete of a record another organisation links to is refused: the apply would change that organisation\'s data', async () => {
+  const shared = fakeDb({ master: { ...masterState(), ...contactsOf(URIS.siteB, [URIS.oldContact]) }, records: { [URIS.siteB]: { uuid: IDS.siteB, classes: [`${NS.org}Site`] } } });
+  await assert.rejects(
+    () => service(shared).create(sessions.orgA, body(IDS.org, 'site', [
+      { op: 'update', data: { type: 'sites', id: IDS.site, relationships: { contacts: { data: [] } } } },
+      { op: 'delete', data: { type: 'contact-points', id: IDS.oldContact } },
+    ])),
+    { status: 409, title: 'The record is used outside the organisation', meta: { record: { type: 'contact-points', id: IDS.oldContact } } },
+  );
+  assert.equal(shared.updates.length, 0);
+});
+
+test('the list query and the step text are bounded: unknown filters and pages past the triplestore\'s row limit are a 400, long or empty texts a 422', async () => {
+  assert.throws(() => parseListQuery({ filter: { colour: 'red' } }), { status: 400, detail: /unknown filter\[colour\]/ });
+  assert.throws(() => parseListQuery({ filter: { created: { gt: '2026-01-01' } } }), { status: 400, detail: /unknown filter\[created\]\[gt\]/ });
+  assert.throws(() => parseListQuery({ page: { number: '500', size: '20' } }), { status: 400, detail: 'page[number] must be a whole number from 0 to 499' });
+  assert.deepEqual(parseListQuery({ page: { number: '499', size: '20' } }).page, { number: 499, size: 20 });
+  assert.throws(() => parseListQuery({ page: { number: '4294967296' } }), { status: 400 });
+  assert.throws(() => parseListQuery({ filter: { target: 'a\u0000b' } }), { status: 400 });
+  await assert.rejects(() => service(pendingDb()).addStep(sessions.abb, RID(5), step('informatievraag', { reason: '​ ‍' })), { status: 422, detail: 'an informatievraag needs a reason' });
+  await assert.rejects(() => service(pendingDb()).addStep(sessions.abb, RID(5), step('informatievraag', { reason: 'x'.repeat(10001) })), { status: 422, detail: '"reason" is at most 10000 characters long' });
+  await assert.rejects(() => service(fakeDb()).create(sessions.orgA, { data: { type: 'change-requests', attributes: { aggregate: '__proto__', operations: [{}] } } }), { status: 422, pointer: '/data/attributes/aggregate' });
+});
+
+// --- reading back what was written (verifyWrites) -------------------------------------------------------
+
+/**
+ * A stand-in for the read-backs on top of fakeDb: the submission and the apply are read back as complete
+ * unless the test says otherwise (missingTriples: how many inserted triples are missing, values: the
+ * value count of a pair, leftovers: records a delete left, submitted: the versions a submission stored).
+ */
+function verifyingDb({ missingTriples = () => 0, values = () => null, leftovers = () => [], submitted = (expected) => expected, ...options } = {}) {
+  const db = fakeDb(options);
+  const answer = db.query.bind(db);
+  const write = db.update.bind(db);
+  // the versions each submission wrote, to answer its read-back
+  const expectedVersions = new Map();
+  db.update = async (q) => {
+    const request = q.match(/<([^>]+)> a cr:ChangeRequest ;/)?.[1];
+    if (request) expectedVersions.set(request, (q.match(/a cr:ProposedVersion ;/g) || []).length);
+    return write(q);
+  };
+  const uriTerm = (value) => ({ type: 'uri', value });
+  const literalTerm = (value) => ({ type: 'literal', value: String(value) });
+  const readBack = (q) => {
+    if (q.includes('SELECT ?status (COUNT(DISTINCT ?version) AS ?versions)')) {
+      const request = q.match(/\n {2}<([^>]+)> adms:status \?status/)[1];
+      return [{ status: uriTerm(STATUS.ingediend), versions: literalTerm(submitted(expectedVersions.get(request) ?? 0)) }];
+    }
+    if (q.includes('SELECT DISTINCT ?s ?p ?o')) {
+      // the triples asked for exist, but for the missing ones (counted from the end)
+      const asked = q.slice(q.indexOf('VALUES (?s ?p ?o) {'), q.indexOf('}', q.indexOf('VALUES (?s ?p ?o) {'))).split('(<').slice(1);
+      const found = asked.slice(0, asked.length - missingTriples(asked.length));
+      return found.map((triple) => ({ s: uriTerm(triple.slice(0, triple.indexOf('>'))), p: uriTerm('p'), o: literalTerm(triple) }));
+    }
+    if (q.includes('SELECT ?s ?p ?o\nWHERE {\n  VALUES (?s ?p)') && q.includes('lastModifiedBy')) {
+      // the fields an apply replaced, read back: one value each, or as many as the test says
+      return pairsOf(q).flatMap(([s, p]) => Array.from({ length: values(s, p) ?? 1 }, (_, n) => ({ s: uriTerm(s), p: uriTerm(p), o: literalTerm(`value ${n}`) })));
+    }
+    if (q.includes('SELECT DISTINCT ?record')) return leftovers().map((record) => ({ record: uriTerm(record) }));
+    if (q.includes('SELECT (COUNT(DISTINCT ?step) AS ?n)')) return [{ n: literalTerm([...q.matchAll(/\(<[^>]+> <[^>]+>\)/g)].length) }];
+    return null;
+  };
+  db.query = async (q) => {
+    const found = readBack(q);
+    if (!found) return answer(q);
+    await tick();
+    parses(q);
+    db.queries.push(q);
+    return { results: { bindings: found } };
+  };
+  return db;
+}
+const verifying = (db) => createService({ model, config, db, mintUuid: uuidSequence(), clock: clock(), verifyWrites: true });
+const renameOnly = () => rename('Stad Aalst', 'Aalst');
+
+test('an apply is read back before the request is marked afgehandeld: a complete one is', async () => {
+  const db = verifyingDb();
+  const { document } = await verifying(db).create(sessions.orgA, renameOnly());
+  assert.equal(document.attributes.status, 'afgehandeld');
+  assert.ok(db.queries.some((q) => q.includes('SELECT DISTINCT ?s ?p ?o') && q.includes('"""Stad Aalst"""')), 'the new name is read back');
+  assert.ok(db.queries.some((q) => q.includes('SELECT ?s ?p ?o') && q.includes('lastModifiedBy')), 'and that it is the only one');
+  assert.deepEqual(statusesSet(db), ['afgehandeld']);
+});
+
+test('an apply the triplestore cut short is run again; one that stays incomplete is mislukt, and the request is kept with the reason', async () => {
+  let attempts = 0;
+  const once = verifyingDb({ missingTriples: () => (attempts++ === 0 ? 1 : 0) });
+  assert.equal((await verifying(once).create(sessions.orgA, renameOnly())).document.attributes.status, 'afgehandeld', 'complete the second time');
+  assert.equal(writes(once).filter(isApply).length, 2);
+  const always = verifyingDb({ values: (s, p) => (p === prefLabel ? 2 : null) });
+  await assert.rejects(() => verifying(always).create(sessions.orgA, renameOnly()), (error) => {
+    assert.equal(error.status, 409);
+    assert.match(error.detail, new RegExp(`${URIS.org} ${prefLabel} holds 2 values instead of 1`));
+    return true;
+  });
+  assert.deepEqual(statusesSet(always), ['mislukt']);
+});
+
+test('a submission the triplestore cut short is written again; one that stays incomplete is withdrawn and answered with a 500', async () => {
+  let attempts = 0;
+  const once = verifyingDb({ submitted: (expected) => (attempts++ === 0 ? expected - 1 : expected) });
+  const kept = await verifying(once).create(sessions.orgA, body(IDS.org, 'change-event', changeEventOperations()));
+  assert.equal(kept.document.attributes.status, 'ingediend');
+  assert.equal(writes(once).filter((q) => q.includes('a cr:ChangeRequest ;')).length, 2, 'written twice');
+  const never = verifyingDb({ submitted: (expected) => expected - 1 });
+  await assert.rejects(() => verifying(never).create(sessions.orgA, body(IDS.org, 'change-event', changeEventOperations())), { status: 500, title: 'The change request could not be stored', meta: { 'change-request': { id: sequenceUuid(1), status: 'ingetrokken' } } });
+  assert.deepEqual(statusesSet(never), ['ingetrokken'], 'withdrawn by the service: no incomplete request waits for ABB');
+});
+
+test('when even the failure cannot be recorded, the answer says the outcome is unknown', async () => {
+  const db = fakeDb({ failApply: 2 });
+  const update = db.update.bind(db);
+  db.update = async (q) => {
+    if (q.includes('a oslc:Error')) throw new Error('Virtuoso is gone');
+    return update(q);
+  };
+  await assert.rejects(() => service(db).create(sessions.orgA, body()), {
+    status: 500,
+    title: 'Applying the change request failed, and the failure could not be recorded',
+    detail: /may be partly applied; reload before changing the same data again/,
+  });
 });

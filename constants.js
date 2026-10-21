@@ -118,8 +118,18 @@ export const TARGET_TYPE = 'organizations';
 export const SPARQL_MAX_ROWS = Number.parseInt(process.env.SPARQL_MAX_ROWS, 10) || 10000;
 
 // GET /change-requests is paged: page[size] defaults to DEFAULT_PAGE_SIZE, at most MAX_PAGE_SIZE.
+// Virtuoso refuses an OFFSET past its row limit (SR353), so a page must end within it.
 export const DEFAULT_PAGE_SIZE = 20;
 export const MAX_PAGE_SIZE = 100;
+
+// The size of what one request may carry. The forms send a dozen operations and a handful of
+// values per key; the limits keep a single request from tying up the service and the triplestore
+// (a few hundred records overflow Virtuoso's stack on the apply, thousands of values per key take
+// seconds to merge), and are refused with a 422 that names them.
+export const MAX_OPERATIONS = 100;
+export const MAX_VALUES_PER_KEY = 100;
+// The longest text a step or a submission carries (a question, an answer, a reason).
+export const MAX_TEXT_LENGTH = 10000;
 
 export const PREFIXES = Object.entries(NS)
   .map(([prefix, uri]) => `PREFIX ${prefix}: <${uri}>`)

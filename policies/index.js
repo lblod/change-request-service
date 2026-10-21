@@ -11,14 +11,16 @@ import {
 
 // Ordered: the first rule that answers decides; no answer means deny.
 
-// Who may submit an edit or a change-event request on an organisation that exists, and apply a
-// failed one again (hertoepassing).
+// Who may submit an edit or a change-event request on an organisation that exists.
 export const canEdit = [abbEditsAll, ownOrganisation];
 // Who may request a new organisation of the classification the request proposes.
 export const canCreate = [abbEditsAll, mayCreateClassification];
 // Whether a submitted request is applied at once (a goedkeuring by the service) or waits for ABB:
 // edits always, creations and change events only ABB's own.
 export const autoApprove = [editsApplyAtOnce, abbAutoApproves];
+// Who applies a request whose apply failed again (hertoepassing): ABB and the organisation that
+// submitted it, whatever the request's kind.
+export const canReapply = [abbEditsAll, requestingOrganisation];
 // Who approves (goedkeuring), rejects (afkeuring) or asks for information (informatievraag).
 export const canDecide = [abbDecidesAll];
 // Who answers a question (informatieantwoord) or contests a rejection (betwisting).
@@ -32,8 +34,10 @@ export const supersede = [supersededByOwnRequest];
 // Who sees a request is not a rule list but a filter on the listing (lib/change-requests.js), set
 // by config.pendingVisibleTo: "everyone" shows every request to every logged-in user, "involved"
 // shows a request that still waits only to the requesting organisation, the organisation it is
-// about and ABB. ABB always sees everything, and everyone sees an applied request. What a viewer
-// sees of a request also depends on who they are: the person who submitted it and the texts of
-// its steps (questions, answers, reasons) are shown to the requesting organisation and ABB only.
+// about and ABB. ABB always sees everything, and everyone sees a decided request. What a viewer
+// sees of a request also depends on who they are: the person who submitted it, the texts of its
+// steps (questions, answers, reasons) and the error of a failed apply are shown to the requesting
+// organisation and ABB only. The list leaves edits out unless asked for them: they are the
+// history of the data, not requests anyone acts on.
 
 export { evaluate, ruleName } from './evaluate.js';

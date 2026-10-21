@@ -29,7 +29,7 @@ const predicates = (version) => [...new Set(version.triples.map((t) => t.predica
 test('collectReferences gathers the ids of updates, deletes and relationship references', () => {
   assert.deepEqual(
     collectReferences(operations).sort(),
-    [IDS.address, IDS.site, IDS.structuredKbo, IDS.org, IDS.kboIdentifier, IDS.oldContact, IDS.siteType, IDS.gemeenteCode].sort(),
+    [IDS.address, IDS.site, IDS.structuredKbo, IDS.org, IDS.kboIdentifier, IDS.oldContact, IDS.siteType, IDS.gemeenteCode, IDS.location].sort(),
   );
   assert.deepEqual(collectReferences(null), []);
 });
@@ -44,23 +44,30 @@ test('the aggregate whitelist admits subtypes of its types, the relationships be
   assert.ok(isReferenceType(model, aggregate, 'locations'));
   assert.ok(isReferenceType(model, aggregate, 'site-types'));
   assert.ok(!isReferenceType(model, aggregate, 'organization-status-codes'));
+  // what the kerngegevens may change of an organisation ("writable"): not the werkingsgebied, the juridische
+  // vorm or the bijkomende kwalificaties (they change through a change event), nor located-within, exact-match
+  // or the agent's contacts, although their targets are references or members of the aggregate
   assert.deepEqual(aggregatePredicates(model, aggregate, 'administrative-units'), [
-    `${NS.schema}contactPoint`,
     `${NS.org}hasPrimarySite`,
     `${NS.org}hasSite`,
     `${NS.org}purpose`,
     `${NS.skos}altLabel`,
     `${NS.skos}prefLabel`,
-    `${NS.skos}exactMatch`,
     `${NS.regorg}legalName`,
     `${NS.adms}identifier`,
     `${NS.lblodgeneriek}geplandeEindDatum`,
+    `${NS.code}inhoudelijkThema`,
+  ].sort());
+  // through the site aggregate only its sites
+  assert.deepEqual(aggregatePredicates(model, config.aggregates.site, 'administrative-units'), [`${NS.org}hasPrimarySite`, `${NS.org}hasSite`].sort());
+  // through a change event the fields an event changes
+  assert.deepEqual(aggregatePredicates(model, config.aggregates['change-event'], 'administrative-units'), [
+    `${NS.skos}prefLabel`,
+    `${NS.regorg}legalName`,
+    `${NS.regorg}orgStatus`,
     `${NS.besluit}werkingsgebied`,
     `${NS.organisatie}rechtsvorm`,
-    `${NS.code}inhoudelijkThema`,
-    // additional-qualification-codes are concepts, located-within points at a location
     `${NS.code}bijkomendeKwalificatie`,
-    'http://www.opengis.net/ont/geosparql#sfWithin',
   ].sort());
   assert.deepEqual(aggregatePredicates(model, aggregate, 'structured-identifiers'), [`${NS.generiek}lokaleIdentificator`]);
   assert.deepEqual(aggregatePredicates(model, aggregate, 'sites'), [`${NS.dct}description`, `${NS.ere}vestigingstype`, `${NS.org}siteAddress`, `${NS.organisatie}bestaatUit`].sort());
@@ -141,10 +148,19 @@ test('builds one version per operation with fresh URIs, master URIs, typed tripl
   assert.deepEqual(objects(org, `${NS.org}classification`), [], 'classification is outside the aggregate');
   assert.ok(!org.replaces.includes(`${NS.org}classification`), 'and is not replaced');
   assert.deepEqual(org.unchanged, [
-    { name: 'classification', predicate: `${NS.org}classification`, objects: [URIS.gemeenteCode], where: '/data/attributes/operations/4/data/relationships/classification' },
+    {
+      key: { name: 'classification', kind: 'relationship', predicate: `${NS.org}classification`, cardinality: 'one', target: 'organization-classification-codes' },
+      items: [URIS.gemeenteCode],
+      where: '/data/attributes/operations/4/data/relationships/classification',
+    },
+    {
+      key: { name: 'scope', kind: 'relationship', predicate: `${NS.besluit}werkingsgebied`, cardinality: 'one', target: 'locations' },
+      items: [URIS.location],
+      where: '/data/attributes/operations/4/data/relationships/scope',
+    },
   ]);
   assert.deepEqual(objects(org, `${NS.besluit}werkingsgebied`), []);
-  assert.ok(org.replaces.includes(`${NS.besluit}werkingsgebied`), 'scope is a reference: null clears it');
+  assert.ok(!org.replaces.includes(`${NS.besluit}werkingsgebied`), 'scope is read-only through the kerngegevens: an unchanged check');
   assert.ok(!org.replaces.includes(`${NS.schema}contactPoint`), 'contacts was not carried: left as it is');
   assert.ok(!org.replaces.includes(`${NS.org}organization`) && !org.replaces.includes(`${NS.org}member`), 'inverse relationships are ignored');
   assert.deepEqual(predicates(org), [`${NS.adms}identifier`, `${NS.org}hasPrimarySite`, `${NS.skos}altLabel`, `${NS.skos}prefLabel`].sort());
@@ -206,8 +222,8 @@ test('an id that does not belong to the target organisation is refused, as opera
   );
   assert.equal(forB.versions[0].masterUri, URIS.siteB);
   // references and relationships outside the aggregate only have to exist
-  const { versions } = build([{ op: 'update', data: { type: 'administrative-units', id: IDS.org, relationships: { scope: { data: { type: 'locations', id: IDS.location } } } } }]);
-  assert.deepEqual(objects(versions[0], `${NS.besluit}werkingsgebied`), [`<${URIS.location}>`]);
+  const { versions } = build([{ op: 'update', data: { type: 'sites', id: IDS.site, relationships: { 'site-type': { data: { type: 'site-types', id: IDS.siteType } } } } }]);
+  assert.deepEqual(objects(versions[0], `${NS.ere}vestigingstype`), [`<${URIS.siteType}>`]);
 });
 
 test('an organisation is only ever updated, and only the target itself', () => {
@@ -225,13 +241,16 @@ test('a relationship outside the aggregate is kept for the unchanged check, refu
   const { versions } = build([
     { op: 'update', data: { type: 'administrative-units', id: IDS.org, relationships: { 'organization-status': { data: { type: 'organization-status-codes', id: IDS.statusCode } }, classification: { data: null } } } },
   ]);
-  assert.deepEqual(versions[0].unchanged.map(({ name, objects }) => [name, objects]), [['organization-status', [URIS.statusCode]], ['classification', []]]);
+  assert.deepEqual(versions[0].unchanged.map(({ key, items }) => [key.name, items]), [['organization-status', [URIS.statusCode]], ['classification', []]]);
   assert.deepEqual(versions[0].replaces, []);
   expect422(
     [{ op: 'create', data: { type: 'contact-points', lid: 'c1', relationships: { vendor: { data: { type: 'vendors', id: IDS.site } } } } }],
-    model.has('vendors') ? /relationship "vendor" is not part of the aggregate "organization-core-data" and cannot be set on a new contact-points/ : /unknown relationship "vendor"/,
+    model.has('vendors') ? /relationship "vendor" cannot be set on a new contact-points through the aggregate "organization-core-data"/ : /unknown relationship "vendor"/,
   );
-  const created = build([{ op: 'create', data: { type: 'sites', lid: 's1', relationships: { 'site-type': { data: { type: 'site-types', id: IDS.siteType } } } } }]);
+  const created = build([
+    { op: 'create', data: { type: 'sites', lid: 's1', relationships: { 'site-type': { data: { type: 'site-types', id: IDS.siteType } } } } },
+    { op: 'update', data: { type: 'administrative-units', id: IDS.org, relationships: { sites: { data: [{ type: 'sites', id: IDS.site }, { type: 'sites', lid: 's1' }] } } } },
+  ]);
   assert.deepEqual(objects(created.versions[0], `${NS.ere}vestigingstype`), [`<${URIS.siteType}>`], 'a reference may be set on a create');
 });
 
@@ -352,7 +371,7 @@ test('an update records every carried key with its proposal and, when meta.base 
     base: { objects: ['"""Aalst"""'], items: ['Aalst'] },
     where: '/data/attributes/operations/4/data/attributes/name',
   });
-  assert.deepEqual(org.keys.map((key) => key.name), ['name', 'alternative-name', 'legal-name', 'expected-end-date', 'purpose', 'primary-site', 'sites', 'identifiers', 'scope'], 'attributes, then the admitted relationships; classification is an unchanged check, memberships inverse');
+  assert.deepEqual(org.keys.map((key) => key.name), ['name', 'alternative-name', 'legal-name', 'expected-end-date', 'purpose', 'primary-site', 'sites', 'identifiers'], 'attributes, then the admitted relationships; classification and scope are unchanged checks, memberships inverse');
   const contacts = site.keys.find((key) => key.name === 'contacts');
   assert.deepEqual(contacts.base, { objects: [`<${URIS.oldContact}>`], items: [URIS.oldContact] });
   assert.deepEqual(contacts.proposed, [contact.masterUri], 'the proposal points at the minted master of the lid');
@@ -422,7 +441,7 @@ test('meta.base is only for an update or a delete, must be well-formed and fit t
   );
   assert.deepEqual(versions[0].keys.find((key) => key.name === 'primary-site').base.items, [goneUri]);
   assert.deepEqual(versions[0].keys.find((key) => key.name === 'sites').base.items, [URIS.siteB]);
-  assert.deepEqual(versions[0].unchanged[0].base, { uris: [] }, 'the unchanged check keeps its base too');
+  assert.deepEqual(versions[0].unchanged[0].base, { items: [] }, 'the unchanged check keeps its base too');
   assert.equal(build(update({ base: { attributes: { purpose: 'x' } } })).versions[0].keys.find((key) => key.name === 'purpose'), undefined, 'a base for a key the document does not carry is ignored');
 });
 
@@ -568,7 +587,7 @@ test('values compare under their datatype and sets as sets', () => {
 test('an update that changes nothing leaves no version; creates and deletes stay', () => {
   const { versions } = settle([
     { op: 'update', data: { type: 'structured-identifiers', id: IDS.structuredKbo, attributes: { 'local-id': '0207437468' } } },
-    { op: 'create', data: { type: 'contact-points', lid: 'c1', attributes: { email: 'info@aalst.be' } } },
+    { op: 'create', data: { type: 'contact-points', lid: 'c1', attributes: { email: 'info@aalst.be' }, relationships: { 'contact-address': { data: { type: 'addresses', id: IDS.address } } } } },
     { op: 'delete', data: { type: 'contact-points', id: IDS.oldContact } },
   ]);
   assert.deepEqual(versions.map((version) => version.operation), ['create', 'delete']);
@@ -612,7 +631,7 @@ test('a relationship outside the aggregate may be carried as loaded or as the ma
   const reclassified = withState({ [`${URIS.org} ${NS.org}classification`]: [uri('http://data.vlaanderen.be/id/concept/BestuurseenheidClassificatieCode/other')] });
   assert.deepEqual(settle(classification(code, code), reclassified).versions, [], 'stale but unchanged: not written, not refused');
   assert.deepEqual(settle(classification(code)).versions, [], 'without base: equal to the master');
-  assert.throws(() => settle(classification(code), reclassified), { status: 422, detail: /relationship "classification" is not part of the aggregate/ });
+  assert.throws(() => settle(classification(code), reclassified), { status: 422, detail: /relationship "classification" cannot be changed through the aggregate "organization-core-data"/ });
   assert.throws(() => settle(classification(null, code)), { status: 422, pointer: '/data/attributes/operations/0/data/relationships/classification' });
 });
 
@@ -635,12 +654,11 @@ test('the fixture request against the current state: what each version still wri
   ]);
   assert.deepEqual(site.replaces, [`${NS.ere}vestigingstype`, `${NS.org}siteAddress`].sort());
   assert.deepEqual(site.base.triples, [{ predicate: `${NS.org}siteAddress`, object: `<${URIS.oldContact}>` }], 'the client base of contacts; no site type before');
-  assert.deepEqual(org.replaces, [`${NS.besluit}werkingsgebied`, `${NS.skos}prefLabel`, `${NS.org}hasSite`].sort());
-  assert.deepEqual(org.triples, [{ predicate: `${NS.skos}prefLabel`, object: '"""Stad Aalst"""' }], 'sites and scope are cleared');
+  assert.deepEqual(org.replaces, [`${NS.skos}prefLabel`, `${NS.org}hasSite`].sort(), 'not the werkingsgebied: carried as it is');
+  assert.deepEqual(org.triples, [{ predicate: `${NS.skos}prefLabel`, object: '"""Stad Aalst"""' }], 'the sites are cleared');
   assert.deepEqual(org.base.triples, [
     { predicate: `${NS.skos}prefLabel`, object: '"""Aalst"""' },
     { predicate: `${NS.org}hasSite`, object: `<${URIS.site}>` },
-    { predicate: `${NS.besluit}werkingsgebied`, object: `<${URIS.location}>` },
   ]);
   assert.deepEqual(carriedPairs(build().versions).filter(({ subject }) => subject === URIS.structuredKbo), [{ subject: URIS.structuredKbo, predicate: `${NS.generiek}lokaleIdentificator` }]);
   assert.ok(carriedPairs(build().versions).some(({ subject, predicate }) => subject === URIS.org && predicate === `${NS.org}classification`), 'the unchanged checks are read too');
@@ -696,7 +714,7 @@ test('replacedStates: what the masters held, for the keys the versions change, a
   const { versions } = settle(
     [
       ...orgUpdate({ name: 'Stad Aalst' }, { name: 'Aalst' }),
-      { op: 'create', data: { type: 'contact-points', lid: 'c1', attributes: { email: 'info@aalst.be' } } },
+      { op: 'create', data: { type: 'contact-points', lid: 'c1', attributes: { email: 'info@aalst.be' }, relationships: { 'contact-address': { data: { type: 'addresses', id: IDS.address } } } } },
       { op: 'delete', data: { type: 'contact-points', id: IDS.oldContact } },
     ],
     state,
@@ -714,4 +732,98 @@ test('replacedStates: what the masters held, for the keys the versions change, a
   assert.deepEqual(states[1].links, [{ uri: `http://data.lblod.info/id/record-links/${sequenceUuid(3)}`, uuid: sequenceUuid(3), subject: URIS.site, predicate: `${NS.org}siteAddress` }]);
   const gone = replacedStates({ versions, current: currentMap(state), incoming: incomingMap(state), model, mintUuid: uuidSequence(), present: (version) => version.masterUri !== URIS.oldContact });
   assert.deepEqual(gone.map((replaced) => replaced.masterUri), [URIS.org], 'no state for a record that is gone');
+});
+
+// --- what an aggregate may change, and what a request may create ------------------------------------
+
+test('the kerngegevens may not change the werkingsgebied, the juridische vorm or the bijkomende kwalificaties: unchanged they pass, changed they are a 422', () => {
+  // carried as the page loaded it: not written, not refused
+  const scope = { data: { type: 'locations', id: IDS.location } };
+  assert.deepEqual(settle([{ op: 'update', data: { type: 'administrative-units', id: IDS.org, relationships: { scope }, meta: { base: { relationships: { scope } } } } }]).versions, []);
+  // changed: refused, with the pointer at the key
+  assert.throws(
+    () => settle([{ op: 'update', data: { type: 'administrative-units', id: IDS.org, relationships: { scope: { data: null } } } }]),
+    { status: 422, detail: 'relationship "scope" cannot be changed through the aggregate "organization-core-data"', pointer: '/data/attributes/operations/0/data/relationships/scope' },
+  );
+  for (const name of ['legal-form', 'additional-qualifications']) {
+    const version = build([{ op: 'update', data: { type: 'administrative-units', id: IDS.org, relationships: { [name]: { data: name === 'legal-form' ? null : [] } } } }]).versions[0];
+    assert.deepEqual(version.keys, [], `${name} is not a key the kerngegevens write`);
+    assert.deepEqual(version.unchanged.map(({ key }) => key.name), [name], `${name} is an unchanged check`);
+  }
+});
+
+test('through a site the organisation may change its sites and primary site only; its attributes too are read-only there', () => {
+  const site = (attributes, relationships) =>
+    buildVersions({ operations: [{ op: 'update', data: { type: 'administrative-units', id: IDS.org, attributes, relationships } }], aggregateName: 'site', aggregate: config.aggregates.site, model, mintUuid: uuidSequence(), resources, reachable, target });
+  assert.deepEqual(site({}, { sites: { data: [{ type: 'sites', id: IDS.site }] } }).versions[0].keys.map((key) => key.name), ['sites']);
+  const renamed = site({ name: 'Gent was here' }, {}).versions[0];
+  assert.deepEqual(renamed.keys, [], 'the name is not a key of the site aggregate');
+  assert.deepEqual(renamed.unchanged.map(({ key, items }) => [key.kind, key.name, items]), [['attribute', 'name', ['Gent was here']]]);
+  const settled = (state) => settleVersions({ versions: [renamed], current: currentMap(state), incoming: incomingMap(state), model, aggregateName: 'site', mintUuid: uuidSequence() });
+  assert.throws(() => settled(masterState()), { status: 422, detail: 'attribute "name" cannot be changed through the aggregate "site"', pointer: '/data/attributes/operations/0/data/attributes/name' });
+  assert.deepEqual(settled({ ...masterState(), [`${URIS.org} ${NS.skos}prefLabel`]: [literal('Gent was here')] }).versions, [], 'equal to what the organisation holds: passes');
+});
+
+test('everything a request creates is linked to the organisation, directly or through the other records of the request', () => {
+  // a contact point nothing links to, and none it links to
+  expect422([{ op: 'create', data: { type: 'contact-points', lid: 'c1', attributes: { email: 'x@aalst.be' } } }], /the new contact-points "c1" is not linked to the organisation/);
+  // two records that only link to each other
+  expect422(
+    [
+      { op: 'create', data: { type: 'sites', lid: 's1', relationships: { contacts: { data: [{ type: 'contact-points', lid: 'c1' }] } } } },
+      { op: 'create', data: { type: 'contact-points', lid: 'c1', attributes: { email: 'x@aalst.be' } } },
+    ],
+    /the new sites "s1" is not linked to the organisation/,
+  );
+  // linked from the organisation, or linking to a record of its aggregate
+  const linked = build([
+    { op: 'create', data: { type: 'sites', lid: 's1', relationships: { contacts: { data: [{ type: 'contact-points', lid: 'c1' }] } } } },
+    { op: 'create', data: { type: 'contact-points', lid: 'c1', attributes: { email: 'x@aalst.be' } } },
+    { op: 'update', data: { type: 'administrative-units', id: IDS.org, relationships: { sites: { data: [{ type: 'sites', lid: 's1' }] } } } },
+  ]);
+  assert.equal(linked.versions.length, 3);
+  assert.equal(build([{ op: 'create', data: { type: 'contact-points', lid: 'c1', relationships: { 'contact-address': { data: { type: 'addresses', id: IDS.address } } } } }]).versions.length, 1);
+});
+
+test('a create that names records on an inverse relationship is named by them on the forward side, or the link would be lost', () => {
+  const event = (relationships = {}) => ({ op: 'create', data: { type: 'change-events', lid: 'e1', relationships: { 'original-organizations': { data: [{ type: 'administrative-units', id: IDS.org }] }, ...relationships } } });
+  const result = { op: 'create', data: { type: 'change-event-results', lid: 'r1', relationships: { 'result-from': { data: { type: 'change-events', lid: 'e1' } }, 'resulting-organization': { data: { type: 'administrative-units', id: IDS.org } } } } };
+  const changeEvent = (operations) => buildVersions({ operations, aggregateName: 'change-event', aggregate: config.aggregates['change-event'], model, mintUuid: uuidSequence(), resources, reachable, target });
+  assert.throws(() => changeEvent([event(), result]), { status: 422, detail: /relationship "result-from" of a new change-event-results is the inverse of "results" on change-events: set the link there/ });
+  assert.equal(changeEvent([event({ results: { data: [{ type: 'change-event-results', lid: 'r1' }] } }), result]).versions.length, 2, 'given on both sides: the forward triple is written');
+});
+
+test('a request carries at most a hundred operations and a hundred values per key', () => {
+  const many = Array.from({ length: 101 }, (_, n) => ({ op: 'update', data: { type: 'contact-points', id: `id-${n}` } }));
+  expect422(many, 'a request carries at most 100 operations, this one 101');
+  expect422(
+    [{ op: 'update', data: { type: 'administrative-units', id: IDS.org, attributes: { 'alternative-name': Array.from({ length: 101 }, (_, n) => `naam ${n}`) } } }],
+    'attribute "alternative-name" carries at most 100 values, here 101',
+  );
+  expect422(
+    [{ op: 'update', data: { type: 'administrative-units', id: IDS.org, relationships: { sites: { data: Array.from({ length: 101 }, () => ({ type: 'sites', id: IDS.site })) } } } }],
+    'relationship "sites" carries at most 100 values, here 101',
+  );
+});
+
+test('a set merge is linear: twenty thousand values merge in a moment', () => {
+  const key = { name: 'alternative-name', kind: 'attribute', predicate: `${NS.skos}altLabel`, attributeType: 'string-set' };
+  const values = Array.from({ length: 20000 }, (_, n) => `naam ${n}`);
+  const proposed = [...values.slice(1), 'nieuw'];
+  const started = Date.now();
+  const { remove, insert } = mergeSet({ key, proposed, proposedObjects: proposed.map((value) => `"${value}"`), base: values, currentBindings: values.map((value) => literal(value)) });
+  assert.ok(Date.now() - started < 2000, `took ${Date.now() - started} ms`);
+  assert.deepEqual(remove, ['"""naam 0"""']);
+  assert.deepEqual(insert, ['"nieuw"']);
+});
+
+test('a base names keys of the type, as the document does: an unknown one is a 422', () => {
+  expect422(
+    [{ op: 'update', data: { type: 'administrative-units', id: IDS.org, attributes: { name: 'Stad Aalst' }, meta: { base: { attributes: { colour: 'blauw' } } } } }],
+    'unknown attribute "colour" for type "administrative-units"',
+  );
+  expect422(
+    [{ op: 'update', data: { type: 'administrative-units', id: IDS.org, attributes: { name: 'Stad Aalst' }, meta: { base: { relationships: { friends: { data: [] } } } } } }],
+    'unknown relationship "friends" for type "administrative-units"',
+  );
 });
