@@ -168,10 +168,41 @@ test('the configuration is checked against the model: unknown types and referenc
     fs.writeFileSync(file, JSON.stringify(config));
     return file;
   };
-  const base = { abbUri: 'http://example.org/abb', statusScheme: 'http://example.org/statuses' };
-  const loaded = loadConfig(write({ ...base, aggregates: { site: { root: 'sites', members: ['addresses'], references: ['site-types'] } } }), model);
+  const base = { abbUri: 'http://example.org/abb', pendingVisibleTo: 'everyone' };
+  const site = (extra = {}) => ({ site: { kind: 'edit', root: 'sites', members: ['addresses', 'organizations'], references: ['site-types'], ...extra } });
+  const loaded = loadConfig(write({ ...base, aggregates: site() }), model);
   assert.deepEqual(loaded.aggregates.site.references, ['site-types']);
-  assert.throws(() => loadConfig(write({ ...base, aggregates: { site: { root: 'sites', members: ['addresses'], references: ['gebouwen'] } } }), model), /names the type "gebouwen"/);
-  assert.throws(() => loadConfig(write({ ...base, aggregates: { site: { root: 'sites', members: ['addresses'], references: ['addresses'] } } }), model), /both as a type it operates on and as a reference/);
-  assert.throws(() => loadConfig(write({ ...base, aggregates: { site: { root: 'sites', members: ['addresses'], references: 'site-types' } } }), model), /"references" must be an array/);
+  assert.throws(() => loadConfig(write({ ...base, aggregates: site({ references: ['gebouwen'] }) }), model), /names the type "gebouwen"/);
+  assert.throws(() => loadConfig(write({ ...base, aggregates: site({ references: ['addresses'] }) }), model), /both as a type it operates on and as a reference/);
+  assert.throws(() => loadConfig(write({ ...base, aggregates: site({ references: 'site-types' }) }), model), /"references" must be an array/);
+  // nothing fails open: no kind, no visibility, an aggregate named after a property of every object
+  assert.throws(() => loadConfig(write({ ...base, aggregates: site({ kind: undefined }) }), model), /needs a "kind"/);
+  assert.throws(() => loadConfig(write({ abbUri: base.abbUri, aggregates: site() }), model), /"pendingVisibleTo" must be one of everyone, involved/);
+  assert.throws(() => loadConfig(write({ ...base, pendingVisibleTo: null, aggregates: site() }), model), /"pendingVisibleTo" must be one of/);
+  // writable: types the aggregate operates on, keys those types (or their subtypes) have
+  assert.deepEqual(loadConfig(write({ ...base, aggregates: site({ writable: { organizations: ['sites', 'scope'] } }) }), model).aggregates.site.writable, { organizations: ['sites', 'scope'] });
+  assert.throws(() => loadConfig(write({ ...base, aggregates: site({ writable: { locations: ['label'] } }) }), model), /"writable" names "locations", which is not a type the aggregate operates on/);
+  assert.throws(() => loadConfig(write({ ...base, aggregates: site({ writable: { organizations: ['colour'] } }) }), model), /"writable.organizations" names "colour"/);
+  // registration: required by a creation, its types organisations the creation creates, every classification once
+  const creation = { 'new-organisation': { kind: 'creation', root: 'organizations', members: ['identifiers'], references: ['organization-classification-codes'] } };
+  const registration = { types: { 'administrative-units': ['http://example.org/agb'], 'registered-organizations': ['http://example.org/zorgraad'] }, foundingEventType: 'http://example.org/oprichting' };
+  assert.throws(() => loadConfig(write({ ...base, aggregates: creation }), model), /"registration.types" must map/);
+  assert.deepEqual(loadConfig(write({ ...base, aggregates: creation, registration }), model).registration.kboOptional, []);
+  assert.throws(() => loadConfig(write({ ...base, aggregates: creation, registration: { ...registration, types: { sites: ['http://example.org/agb'] } } }), model), /names "sites", which is not organizations or a subtype/);
+  assert.throws(() => loadConfig(write({ ...base, aggregates: creation, registration: { ...registration, types: { 'administrative-units': ['http://example.org/x'], 'registered-organizations': ['http://example.org/x'] } } }), model), /registers http:\/\/example.org\/x as both/);
+  assert.throws(() => loadConfig(write({ ...base, aggregates: creation, registration: { ...registration, foundingEventType: undefined } }), model), /"registration.foundingEventType"/);
+  assert.throws(() => loadConfig(write({ ...base, aggregates: creation, registration: { ...registration, kboOptional: ['http://example.org/ilv'] } }), model), /"registration.kboOptional" must list classification URIs of "registration.types"/);
+  assert.throws(
+    () => loadConfig(write({ ...base, aggregates: creation, registration, creatableClassifications: { 'http://example.org/gemeente': ['http://example.org/welzijnsvereniging'] } }), model),
+    /lists http:\/\/example.org\/welzijnsvereniging, which "registration.types" does not register/,
+  );
+});
+
+test('the configuration app-lokale-verkenner mounts is this one: the two copies are kept equal', (t) => {
+  const app = path.resolve('../app-lokale-verkenner/config/change-requests/change-requests.json');
+  if (!fs.existsSync(app)) {
+    t.skip('no app-lokale-verkenner checkout next to this one');
+    return;
+  }
+  assert.deepEqual(JSON.parse(fs.readFileSync(app, 'utf8')), JSON.parse(fs.readFileSync(path.resolve('config/change-requests.json'), 'utf8')));
 });
