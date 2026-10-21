@@ -6,16 +6,22 @@ attributed to the user in deltas and logs. The service uses no sudo.
 
 ## The configuration in app-lokale-verkenner
 
-All data lives in `http://mu.semte.ch/graphs/public` and every session carries the `public` group
-(`config/authorization/config.lisp`):
+The organisation data lives in `http://mu.semte.ch/graphs/administrative-unit`, the graph OP keeps
+it in, and logged-in sessions read it. The public graph holds the code lists, the locations and the
+accounts of mock-login, which everyone reads (`config/authorization/config.lisp`):
 
 ```lisp
-;; read side: anyone reads the organisation data; nobody gets a write grant on this spec
+;; everyone reads it, also without a login: code lists, locations, the mock-login accounts, and of
+;; the organisation of a mock account its type and uuid (the mock-login page needs them)
 (define-graph public ("http://mu.semte.ch/graphs/public")
   (_ -> _))
 
+;; the organisation data, read by every logged-in session; nobody gets a write grant on this spec
+(define-graph organisations ("http://mu.semte.ch/graphs/administrative-unit")
+  (_ -> _))
+
 ;; the same graph as the service may write it: only the types of its aggregates
-(define-graph organisation-data ("http://mu.semte.ch/graphs/public")
+(define-graph organisation-data ("http://mu.semte.ch/graphs/administrative-unit")
   ("org:Organization" -> _) ("besluit:Bestuurseenheid" -> _) ("regorg:RegisteredOrganization" -> _)
   ("org:Site" -> _) ("locn:Address" -> _) ("schema:ContactPoint" -> _) ("adms:Identifier" -> _)
   ("generiek:GestructureerdeIdentificator" -> _)
@@ -30,13 +36,24 @@ All data lives in `http://mu.semte.ch/graphs/public` and every session carries t
 (define-graph sessions ("http://mu.semte.ch/graphs/sessions")
   ("session:Session" -> _))
 
+(supply-allowed-group "public")
+
+;; a session with an organisation and a role, as mock-login (later the login with ACM/IDM) writes it
+(supply-allowed-group "logged-in"
+  :parameters ()
+  :query "... SELECT DISTINCT ?session_group ?session_role WHERE {
+            <SESSION_ID> ext:sessionGroup/mu:uuid ?session_group ; ext:sessionRole ?session_role . }")
+
 ;; Nobody writes the organisation data directly: every edit is a change request.
 (grant (read) :to-graph public :for-allowed-group "public")
+(grant (read) :to-graph organisations :for-allowed-group "logged-in")
 
 (with-scope "http://services.lblod.info/change-request-service"
-  (grant (read) :to-graph (public sessions) :for-allowed-group "public")
+  (grant (read) :to-graph (public organisations sessions) :for-allowed-group "public")
   (grant (read write) :to-graph (organisation-data change-requests) :for-allowed-group "public"))
 ```
+
+The service's `APPLICATION_GRAPH` is that organisation graph: its updates name it.
 
 ## What it rests on
 
@@ -57,8 +74,14 @@ All data lives in `http://mu.semte.ch/graphs/public` and every session carries t
   writable graph whose `define-graph` matches the type of its subject, and refuses the update when
   a quad matches none. So every class the service writes must be in a writable spec, and the
   writable spec of the data graph must not be `(_ -> _)`: it would match the service's own records
-  too and put them in the data graph, readable by everyone. Hence the second, typed spec on the
-  same graph.
+  too and put them in the data graph, which every logged-in session reads. Hence the second, typed
+  spec on the same graph.
+- **Reads are per graph.** A group that may read one spec of a graph reads all of that graph: a
+  typed spec narrows where writes go, not what a read returns. So the organisation data is in a
+  graph of its own rather than in the public one behind a typed read spec. What a visitor without
+  a session needs of it, the organisation of a mock account on the mock-login page, is in the
+  public graph as its type and uuid, which never change (the migration that moved the data out
+  keeps them there).
 - **No other write grant on the data graph**, so a direct POST, PATCH or DELETE on a resource route
   has no writable graph and is refused (mu-cl-resources answers 500).
 - **Reads see all accessible graphs.** sparql-parser does not narrow a pattern to the graph a

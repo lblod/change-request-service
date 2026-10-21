@@ -8,7 +8,7 @@
 # KBO numbers (normalised, required, claimed again on approval), what the kerngegevens and a
 # vestiging may change, ABB's own stale change event, the limits of the API.
 # Every change it makes is put back at the end, also when it is interrupted: the organisations it
-# registered and the change events it applied are removed from the public graph (directly in
+# registered and the change events it applied are removed from the organisation graph (directly in
 # Virtuoso: an organisation is never deleted through a request), the audit stamps of A get their old
 # values, the requests stay as history, and the ones it leaves pending are closed. The change-event
 # types the dev data may lack are inserted for the run and removed again. It writes to Virtuoso
@@ -18,6 +18,7 @@
 #   BASE_URL         the identifier (default http://localhost:88, app-lokale-verkenner docker-compose.dev.yml)
 #   SPARQL_ENDPOINT  Virtuoso, to look up accounts, check graphs and clean up (default http://localhost:8899/sparql)
 #   ORG_A_LABEL, ORG_B_LABEL  two gemeenten by name (default Aalst and Gent)
+#   ORGS_GRAPH       the graph of the organisation data (default http://mu.semte.ch/graphs/administrative-unit)
 set -u
 BASE=${BASE_URL:-http://localhost:88}
 SPARQL=${SPARQL_ENDPOINT:-http://localhost:8899/sparql}
@@ -39,7 +40,10 @@ sparql() { curl -s -H 'Accept: application/sparql-results+json' --data-urlencode
 sparql_update() { curl -s -o /dev/null -w '%{http_code}' --data-urlencode "query=$1" "$SPARQL"; }
 ask() { sparql "ASK { $1 }" | python3 -c "import json,sys; print(json.load(sys.stdin)['boolean'])"; }
 
+# The code lists and the mock-login accounts; the organisation data has a graph of its own, which
+# only logged-in sessions read (as in OP).
 PUBLIC=http://mu.semte.ch/graphs/public
+ORGS=${ORGS_GRAPH:-http://mu.semte.ch/graphs/administrative-unit}
 CRG=http://mu.semte.ch/graphs/change-requests
 CR=http://lblod.data.gift/vocabularies/change-requests/
 RDF=http://www.w3.org/1999/02/22-rdf-syntax-ns#
@@ -76,20 +80,20 @@ PREFIX mu: <http://mu.semte.ch/vocabularies/core/>
 PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
 PREFIX org: <http://www.w3.org/ns/org#>
 PREFIX foaf: <http://xmlns.com/foaf/0.1/>
-SELECT ?orgUuid ?accUuid ?personUuid WHERE { GRAPH <$PUBLIC> {
-  ?org a besluit:Bestuurseenheid ; mu:uuid ?orgUuid ; skos:prefLabel \"$1\" ; org:classification <$2> .
-  ?p foaf:member ?org ; foaf:account ?acc ; mu:uuid ?personUuid . ?acc mu:uuid ?accUuid . } } LIMIT 1" |
+SELECT ?orgUuid ?accUuid ?personUuid WHERE {
+  GRAPH <$ORGS> { ?org a besluit:Bestuurseenheid ; mu:uuid ?orgUuid ; skos:prefLabel \"$1\" ; org:classification <$2> . }
+  GRAPH <$PUBLIC> { ?p foaf:member ?org ; foaf:account ?acc ; mu:uuid ?personUuid . ?acc mu:uuid ?accUuid . } } LIMIT 1" |
   python3 -c "import json,sys; b=json.load(sys.stdin)['results']['bindings'][0]; print(b['orgUuid']['value'], b['accUuid']['value'], b['personUuid']['value'])"
 }
 read -r A_ORG A_ACC A_PERSON < <(lookup "$ORG_A_LABEL" "$GEMEENTE")
 read -r B_ORG B_ACC B_PERSON < <(lookup "$ORG_B_LABEL" "$GEMEENTE")
 read -r ABB_ORG ABB_ACC ABB_PERSON < <(lookup "Agentschap Binnenlands Bestuur" "$ABBCODE")
 echo "A=$ORG_A_LABEL $A_ORG  B=$ORG_B_LABEL $B_ORG  ABB $ABB_ORG"
-uri_of() { sparql "SELECT ?s WHERE { GRAPH <$PUBLIC> { ?s <${MU}uuid> \"$1\" } } LIMIT 1" | python3 -c "import json,sys; print(json.load(sys.stdin)['results']['bindings'][0]['s']['value'])"; }
+uri_of() { sparql "SELECT ?s WHERE { GRAPH <$ORGS> { ?s <${MU}uuid> \"$1\" } } LIMIT 1" | python3 -c "import json,sys; print(json.load(sys.stdin)['results']['bindings'][0]['s']['value'])"; }
 A_URI=$(uri_of "$A_ORG"); B_URI=$(uri_of "$B_ORG")
 # the audit stamps of a record (dct:modified, ext:lastModifiedBy) as triples, to put A's back at the end
 stamps_of() {
-  sparql "SELECT ?p ?o WHERE { GRAPH <$PUBLIC> { <$1> ?p ?o . VALUES ?p { <${DCT}modified> <http://mu.semte.ch/vocabularies/ext/lastModifiedBy> } } }" | python3 -c "
+  sparql "SELECT ?p ?o WHERE { GRAPH <$ORGS> { <$1> ?p ?o . VALUES ?p { <${DCT}modified> <http://mu.semte.ch/vocabularies/ext/lastModifiedBy> } } }" | python3 -c "
 import json, sys
 for b in json.load(sys.stdin)['results']['bindings']:
     o = b['o']
@@ -186,13 +190,13 @@ take_step() { # jar request-id step-type [reason] [override]
   post "$1" "/change-requests/$2/steps" "{\"data\":{\"type\":\"change-request-steps\",\"attributes\":{$attributes}}}"
 }
 PENDING=()   # requests this run leaves waiting for a while; closed at the end if still pending
-CREATED=()   # uuids of records this run wrote to the public graph outside the kerngegevens of A; removed at the end
+CREATED=()   # uuids of records this run wrote to the organisation graph outside the kerngegevens of A; removed at the end
 remember_lids() { # the uuids the last answer minted
   while read -r id; do CREATED+=("$id"); done < <(py "'\n'.join(a['lids'].values())" | tr -d '"')
 }
-remove_record() { # uuid: a record and the links to it, out of the public graph (test data of this run)
-  sparql_update "DELETE { GRAPH <$PUBLIC> { ?x ?q ?s } } WHERE { GRAPH <$PUBLIC> { ?s <${MU}uuid> \"$1\" . ?x ?q ?s } }" >/dev/null
-  sparql_update "DELETE { GRAPH <$PUBLIC> { ?s ?p ?o } } WHERE { GRAPH <$PUBLIC> { ?s <${MU}uuid> \"$1\" ; ?p ?o } }" >/dev/null
+remove_record() { # uuid: a record and the links to it, out of the organisation graph (test data of this run)
+  sparql_update "DELETE { GRAPH <$ORGS> { ?x ?q ?s } } WHERE { GRAPH <$ORGS> { ?s <${MU}uuid> \"$1\" . ?x ?q ?s } }" >/dev/null
+  sparql_update "DELETE { GRAPH <$ORGS> { ?s ?p ?o } } WHERE { GRAPH <$ORGS> { ?s <${MU}uuid> \"$1\" ; ?p ?o } }" >/dev/null
 }
 # --- put things back ----------------------------------------------------------------------------
 # Also when the run is interrupted or a command fails: restore runs once, from the EXIT trap at the
@@ -231,21 +235,21 @@ restore() {
     check "A removes the test vestigingen again" 201 "$(post "$JA" /change-requests "$UNSITE")"
     check "the test vestigingen are gone" "False False" "$(ask "?s <${MU}uuid> \"$SITE_ID\"") $(ask "?s <${MU}uuid> \"$SITE2_ID\"")"
     check "the history keeps its links to them: the deletes leave the versions alone" True "$(ask "GRAPH <$CRG> { ?v a <${CR}ProposedVersion> ; <${CR}masterUuid> \"$A_ORG\" ; <${ORG}hasSite> <http://data.lblod.info/id/vestigingen/$SITE2_ID> }")"
-    check "and the states the removal replaced hold the vestigingen A had" True "$(ask "GRAPH <$CRG> { ?state a <${CR}RecordState> ; <${DCT}isVersionOf> ?o ; <${ORG}hasSite> <http://data.lblod.info/id/vestigingen/$SITE2_ID> . ?s <${PROV}invalidated> ?state } GRAPH <$PUBLIC> { ?o <${MU}uuid> \"$A_ORG\" }")"
+    check "and the states the removal replaced hold the vestigingen A had" True "$(ask "GRAPH <$CRG> { ?state a <${CR}RecordState> ; <${DCT}isVersionOf> ?o ; <${ORG}hasSite> <http://data.lblod.info/id/vestigingen/$SITE2_ID> . ?s <${PROV}invalidated> ?state } GRAPH <$ORGS> { ?o <${MU}uuid> \"$A_ORG\" }")"
   fi
   fi
-  # The organisations this run registered and the change events it applied: out of the public graph
+  # The organisations this run registered and the change events it applied: out of the organisation graph
   # (mu-cl-resources may cache them for a while; the dev stack holds test data only).
   for id in "${CREATED[@]}"; do remove_record "$id"; done
   if [ -n "${NEW_ORG:-}" ] && [ -n "${ABB_NEW_ORG:-}" ] && [ -n "${JABB:-}" ]; then
-    check "the registered organisations and the change events are removed from the public graph" "False False False" "$(ask "?s <${MU}uuid> \"$NEW_ORG\"") $(ask "?s <${MU}uuid> \"$ABB_NEW_ORG\"") $(ask "GRAPH <$PUBLIC> { ?o <${MU}uuid> \"$A_ORG\" . ?e <${ORG}originalOrganization> ?o ; <${DCT}description> \"Naamswijziging (test Lokale Verkenner)\" }")"
+    check "the registered organisations and the change events are removed from the organisation graph" "False False False" "$(ask "?s <${MU}uuid> \"$NEW_ORG\"") $(ask "?s <${MU}uuid> \"$ABB_NEW_ORG\"") $(ask "GRAPH <$ORGS> { ?o <${MU}uuid> \"$A_ORG\" . ?e <${ORG}originalOrganization> ?o ; <${DCT}description> \"Naamswijziging (test Lokale Verkenner)\" }")"
   fi
   for id in "${FIXTURES[@]}"; do sparql_update "DELETE WHERE { GRAPH <$PUBLIC> { <http://lblod.data.gift/concepts/$id> ?p ?o } }" >/dev/null; done
   # A's audit stamps as they were before the run: the applies of the run set them
   if [ -n "${A_URI:-}" ]; then
-    sparql_update "DELETE WHERE { GRAPH <$PUBLIC> { <$A_URI> <${DCT}modified> ?modified } }" >/dev/null
-    sparql_update "DELETE WHERE { GRAPH <$PUBLIC> { <$A_URI> <http://mu.semte.ch/vocabularies/ext/lastModifiedBy> ?by } }" >/dev/null
-    [ -n "$A_STAMPS" ] && sparql_update "INSERT DATA { GRAPH <$PUBLIC> { $A_STAMPS } }" >/dev/null
+    sparql_update "DELETE WHERE { GRAPH <$ORGS> { <$A_URI> <${DCT}modified> ?modified } }" >/dev/null
+    sparql_update "DELETE WHERE { GRAPH <$ORGS> { <$A_URI> <http://mu.semte.ch/vocabularies/ext/lastModifiedBy> ?by } }" >/dev/null
+    [ -n "$A_STAMPS" ] && sparql_update "INSERT DATA { GRAPH <$ORGS> { $A_STAMPS } }" >/dev/null
     check "A's audit stamps are what they were before the run" "$(echo "$A_STAMPS" | sort)" "$(stamps_of "$A_URI" | sort)"
   fi
   if [ -n "${JABB:-}" ] && [ -n "${RUN_START:-}" ]; then
@@ -271,7 +275,15 @@ check "mock-login as ABB" 201 "$(login "$JABB" "$ABB_ACC" "$ABB_ORG")"
 A_NAME=$(name_of "$JA" "$A_ORG")
 B_NAME=$(name_of "$JB" "$B_ORG")
 [ -n "$A_NAME" ] && ok "A reads its organisation ($A_NAME)" || nok "A cannot read its organisation"
-check "anonymous read of an organisation (the public graph is readable without login)" 200 "$(code "$JANON" "/administrative-units/$A_ORG")"
+# A visitor without a session reads the type and the uuid of an organisation of a mock account (the
+# mock-login page lists the accounts with them), none of its data
+fetch "$JANON" "/administrative-units/$A_ORG" >/dev/null
+check "without a session an organisation has no name: its data is for logged-in sessions" null "$(py "a.get('name')")"
+fetch "$JANON" "/sites?page[size]=1" >/dev/null
+check "without a session no vestiging is listed" 0 "$(py "d['meta']['count']")"
+fetch "$JANON" "/accounts?filter[user]=$ORG_A_LABEL&include=user.organizations&page[size]=20" >/dev/null
+check "the mock-login page lists A's account with its organisation" True "$(py "'$A_ORG' in [r['id'] for r in d.get('included', [])]")"
+check "the organisation data is in the organisation graph, not in the public one" "True False" "$(ask "GRAPH <$ORGS> { <$A_URI> <http://www.w3.org/2004/02/skos/core#prefLabel> ?n }") $(ask "GRAPH <$PUBLIC> { <$A_URI> <http://www.w3.org/2004/02/skos/core#prefLabel> ?n }")"
 fetch "$JA" "/administrative-units/$A_ORG" >/dev/null
 A_LEGAL=$(py "json.dumps(a.get('legal-name'))")
 
@@ -400,8 +412,8 @@ check "it is afgehandeld: ABB's goedkeuring and the service's afhandeling" "afge
 check "applied-at is the afhandeling; the target is no longer pending" "True False" "$(py "f\"{a['applied-at'] == a['steps'][6]['at']} {'meta' in d['data']['relationships']['target']}\"")"
 check "the organisation exists now, with its name" "$NEW_NAME" "$(name_of "$JA" "$NEW_ORG")"
 check "with its KBO number" "$KBO1" "$(get "$JA" "/administrative-units/$NEW_ORG/identifiers?include=structured-identifier" | python3 -c "import json,sys; d=json.load(sys.stdin); print(','.join(i['attributes'].get('local-id','') for i in d.get('included',[]) if i['type']=='structured-identifiers'))")"
-check "classified as an AGB, with its primary site (once, not also among its sites) and its oprichting with the link to the besluit, in the public graph" "True False" "$(ask "GRAPH <$PUBLIC> { ?o <${MU}uuid> \"$NEW_ORG\" ; <${ORG}classification> <$AGB_URI> ; <${ORG}hasPrimarySite> ?s . ?e a <${ORG}ChangeEvent> ; <${ORG}originalOrganization> ?o ; <http://data.europa.eu/m8g/hasFormalFramework> ?d . ?d <http://xmlns.com/foaf/0.1/page> ?link }") $(ask "GRAPH <$PUBLIC> { ?o <${MU}uuid> \"$NEW_ORG\" ; <${ORG}hasSite> ?s }")"
-check "its oprichting has its result, the organisation as resulting organisation, and a date" True "$(ask "GRAPH <$PUBLIC> { ?o <${MU}uuid> \"$NEW_ORG\" . ?e a <${ORG}ChangeEvent> ; <${ORG}resultingOrganization> ?o ; <http://purl.org/dc/terms/date> ?date ; <http://lblod.data.gift/vocabularies/organisatie/veranderingsgebeurtenisResultaat> ?r . ?r <http://mu.semte.ch/vocabularies/ext/resultingOrganization> ?o }")"
+check "classified as an AGB, with its primary site (once, not also among its sites) and its oprichting with the link to the besluit, in the organisation graph" "True False" "$(ask "GRAPH <$ORGS> { ?o <${MU}uuid> \"$NEW_ORG\" ; <${ORG}classification> <$AGB_URI> ; <${ORG}hasPrimarySite> ?s . ?e a <${ORG}ChangeEvent> ; <${ORG}originalOrganization> ?o ; <http://data.europa.eu/m8g/hasFormalFramework> ?d . ?d <http://xmlns.com/foaf/0.1/page> ?link }") $(ask "GRAPH <$ORGS> { ?o <${MU}uuid> \"$NEW_ORG\" ; <${ORG}hasSite> ?s }")"
+check "its oprichting has its result, the organisation as resulting organisation, and a date" True "$(ask "GRAPH <$ORGS> { ?o <${MU}uuid> \"$NEW_ORG\" . ?e a <${ORG}ChangeEvent> ; <${ORG}resultingOrganization> ?o ; <http://purl.org/dc/terms/date> ?date ; <http://lblod.data.gift/vocabularies/organisatie/veranderingsgebeurtenisResultaat> ?r . ?r <http://mu.semte.ch/vocabularies/ext/resultingOrganization> ?o }")"
 check "the detail returns the eight operations, the organisation first under its minted uuid" "8 create administrative-units $NEW_ORG $NEW_NAME" "$(fetch "$JA" "/change-requests/$CREATE_ID" >/dev/null; py "f\"{len(a['operations'])} {a['operations'][0]['op']} {a['operations'][0]['data']['type']} {a['operations'][0]['data']['id']} {a['operations'][0]['data']['attributes']['name']}\"")"
 check "filter[target-classification] still finds it, now through the organisation" True "$(fetch "$JB" "/change-requests?filter[target-classification]=$AGB&filter[status]=afgehandeld&filter[created][gte]=$RUN_START" >/dev/null; py "'$CREATE_ID' in ids()")"
 check "the same KBO number again: 409, it names the registered organisation" "409 $NEW_ORG" "$(post "$JA" /change-requests "$(creation_body "$NEW_NAME (ter)" "$KBO1" "$AGB" "")") $(py "d['errors'][0]['meta']['organisation']['id']")"
@@ -416,11 +428,11 @@ check "it is withdrawn again" 201 "$(take_step "$JA" "$(py "d['data']['id']")" i
 check "A requests another AGB" 201 "$(post "$JA" /change-requests "$(creation_body "AGB met betwist nummer (test Lokale Verkenner $STAMP)" "$KBO5" "$AGB" "")")"
 P5=$(py "d['data']['id']"); PENDING+=("$P5")
 KBO5_ID="http://data.lblod.info/id/identificatoren/e2e-$STAMP"; KBO5_SID="http://data.lblod.info/id/gestructureerdeIdentificatoren/e2e-$STAMP"
-sparql_update "INSERT DATA { GRAPH <$PUBLIC> { <$B_URI> <http://www.w3.org/ns/adms#identifier> <$KBO5_ID> . <$KBO5_ID> a <http://www.w3.org/ns/adms#Identifier> ; <${MU}uuid> \"e2e-id-$STAMP\" ; <${SKOS}notation> \"KBO nummer\" ; <https://data.vlaanderen.be/ns/generiek#gestructureerdeIdentificator> <$KBO5_SID> . <$KBO5_SID> a <https://data.vlaanderen.be/ns/generiek#GestructureerdeIdentificator> ; <${MU}uuid> \"e2e-sid-$STAMP\" ; <https://data.vlaanderen.be/ns/generiek#lokaleIdentificator> \"$KBO5\" } }" >/dev/null
+sparql_update "INSERT DATA { GRAPH <$ORGS> { <$B_URI> <http://www.w3.org/ns/adms#identifier> <$KBO5_ID> . <$KBO5_ID> a <http://www.w3.org/ns/adms#Identifier> ; <${MU}uuid> \"e2e-id-$STAMP\" ; <${SKOS}notation> \"KBO nummer\" ; <https://data.vlaanderen.be/ns/generiek#gestructureerdeIdentificator> <$KBO5_SID> . <$KBO5_SID> a <https://data.vlaanderen.be/ns/generiek#GestructureerdeIdentificator> ; <${MU}uuid> \"e2e-sid-$STAMP\" ; <https://data.vlaanderen.be/ns/generiek#lokaleIdentificator> \"$KBO5\" } }" >/dev/null
 check "ABB approves it after B got the number: 409, it names B, nothing applied" "409 $B_ORG ingediend" "$(take_step "$JABB" "$P5" goedkeuring) $(py "d['errors'][0]['meta']['organisation']['id']") $(fetch "$JA" "/change-requests/$P5" >/dev/null; py "a['status']")"
-sparql_update "DELETE WHERE { GRAPH <$PUBLIC> { <$B_URI> <http://www.w3.org/ns/adms#identifier> <$KBO5_ID> } }" >/dev/null
-sparql_update "DELETE WHERE { GRAPH <$PUBLIC> { <$KBO5_ID> ?p ?o } }" >/dev/null
-sparql_update "DELETE WHERE { GRAPH <$PUBLIC> { <$KBO5_SID> ?p ?o } }" >/dev/null
+sparql_update "DELETE WHERE { GRAPH <$ORGS> { <$B_URI> <http://www.w3.org/ns/adms#identifier> <$KBO5_ID> } }" >/dev/null
+sparql_update "DELETE WHERE { GRAPH <$ORGS> { <$KBO5_ID> ?p ?o } }" >/dev/null
+sparql_update "DELETE WHERE { GRAPH <$ORGS> { <$KBO5_SID> ?p ?o } }" >/dev/null
 check "A withdraws it" 201 "$(take_step "$JA" "$P5" intrekking)"
 
 ABB_NEW="AGB van ABB (test Lokale Verkenner $STAMP)"
@@ -461,7 +473,7 @@ check "ABB registers a naamswijziging of A from a form that still shows an older
 ABB_EVENT_ID=$(py "d['data']['id']"); PENDING+=("$ABB_EVENT_ID"); remember_lids
 check "the name is unchanged meanwhile" "$EVENT_NAME" "$(name_of "$JA" "$A_ORG")"
 check "ABB approves it with the token of the conflict it saw" "201 afgehandeld $ABB_EVENT_NAME" "$(take_step "$JABB" "$ABB_EVENT_ID" goedkeuring "" "\"$(fetch "$JABB" "/change-requests/$ABB_EVENT_ID" >/dev/null; py "a['conflicts-token']")\"") $(py "a['status']") $(name_of "$JA" "$A_ORG")"
-check "the change event hangs off A in the public graph, with its type and the link to the besluit" True "$(ask "GRAPH <$PUBLIC> { ?o <${MU}uuid> \"$A_ORG\" . ?e a <${ORG}ChangeEvent> ; <${ORG}originalOrganization> ?o ; <${CH}typeWijziging> <http://lblod.data.gift/concepts/$NAAMSWIJZIGING> ; <http://data.europa.eu/m8g/hasFormalFramework> ?d . ?d <http://xmlns.com/foaf/0.1/page> ?link }")"
+check "the change event hangs off A in the organisation graph, with its type and the link to the besluit" True "$(ask "GRAPH <$ORGS> { ?o <${MU}uuid> \"$A_ORG\" . ?e a <${ORG}ChangeEvent> ; <${ORG}originalOrganization> ?o ; <${CH}typeWijziging> <http://lblod.data.gift/concepts/$NAAMSWIJZIGING> ; <http://data.europa.eu/m8g/hasFormalFramework> ?d . ?d <http://xmlns.com/foaf/0.1/page> ?link }")"
 
 # --- a new vestiging with address and contact point, linked to A (site aggregate) ------------------
 SITE="{\"data\":{\"type\":\"change-requests\",\"attributes\":{\"aggregate\":\"site\",\"operations\":[
@@ -483,7 +495,7 @@ SITE2="{\"data\":{\"type\":\"change-requests\",\"attributes\":{\"aggregate\":\"s
 check "a page that loaded A without the first vestiging adds a second one" 201 "$(post "$JA" /change-requests "$SITE2")"
 check "it is applied without a conflict: the new vestiging is added to the sites, not put in their place" "afgehandeld []" "$(py "a['status'] + ' ' + json.dumps(a['conflicts'])")"
 SITE2_ID=$(py "a['lids']['s2']")
-linked() { ask "GRAPH <$PUBLIC> { ?o <${MU}uuid> \"$A_ORG\" ; <${ORG}hasSite> <http://data.lblod.info/id/vestigingen/$1> }"; }
+linked() { ask "GRAPH <$ORGS> { ?o <${MU}uuid> \"$A_ORG\" ; <${ORG}hasSite> <http://data.lblod.info/id/vestigingen/$1> }"; }
 check "A has both test vestigingen" "True True" "$(linked "$SITE_ID") $(linked "$SITE2_ID")"
 
 # a delete from a page that loaded another e-mail address than the contact point has now
@@ -497,10 +509,10 @@ check "the contact point stays" True "$(ask "?s <${MU}uuid> \"$CP_ID\"")"
 
 # the records live in the right graphs
 check "requests, steps, versions, states and links are in the change-requests graph" True "$(ask "GRAPH <$CRG> { ?r a <${CR}ChangeRequest> . ?s a <${CR}Action> ; <${DCT}isPartOf> ?r . ?v a <${CR}ProposedVersion> . ?b a <${CR}RecordState> }")"
-check "no request, step, version, state or link leaks into the public graph" False "$(ask "GRAPH <$PUBLIC> { ?r a ?t . VALUES ?t { <${CR}ChangeRequest> <${CR}ProposedVersion> <${CR}Action> <${CR}RecordState> <${RDF}Statement> <http://open-services.net/ns/core#Error> } }")"
+check "no request, step, version, state or link leaks into the public graph or the organisation graph" False "$(ask "VALUES ?g { <$PUBLIC> <$ORGS> } GRAPH ?g { ?r a ?t . VALUES ?t { <${CR}ChangeRequest> <${CR}ProposedVersion> <${CR}Action> <${CR}RecordState> <${RDF}Statement> <http://open-services.net/ns/core#Error> } }")"
 check "a request names its organisation (pav:createdBy) and the person who submitted it (dct:creator)" True "$(ask "GRAPH <$CRG> { ?r <${MU}uuid> \"$CREATE_ID\" ; <http://purl.org/pav/createdBy> ?org ; <${DCT}creator> ?person } GRAPH <$PUBLIC> { ?org <${MU}uuid> \"$A_ORG\" . ?person a <http://xmlns.com/foaf/0.1/Person> ; <${MU}uuid> \"$A_PERSON\" }")"
 check "the versions of a request hang off its indiening step; the question, answer, rejection and contest are on their steps" True "$(ask "GRAPH <$CRG> { ?r <${MU}uuid> \"$CREATE_ID\" . ?s a <${CR}Action> ; <${DCT}isPartOf> ?r ; <http://schema.org/position> 1 ; <${PROV}generated> ?v . ?q <${DCT}isPartOf> ?r ; <http://schema.org/position> 2 ; <${DCT}description> \"$QUESTION\" . ?c <${DCT}isPartOf> ?r ; <http://schema.org/position> 5 ; <${DCT}description> \"$CONTEST\" }")"
-check "A carries dct:modified and ext:lastModifiedBy, a person" True "$(ask "GRAPH <$PUBLIC> { ?o <${MU}uuid> \"$A_ORG\" ; <${DCT}modified> ?m ; <http://mu.semte.ch/vocabularies/ext/lastModifiedBy> ?by . ?by a <http://xmlns.com/foaf/0.1/Person> }")"
+check "A carries dct:modified and ext:lastModifiedBy, a person" True "$(ask "GRAPH <$ORGS> { ?o <${MU}uuid> \"$A_ORG\" ; <${DCT}modified> ?m ; <http://mu.semte.ch/vocabularies/ext/lastModifiedBy> ?by . } GRAPH <$PUBLIC> { ?by a <http://xmlns.com/foaf/0.1/Person> }")"
 
 
 # --- the end of the run: put things back, then the summary --------------------------------------

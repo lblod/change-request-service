@@ -6,10 +6,10 @@ The configuration and the model are mounted side by side (`docker-compose.yml`):
 
 ```yaml
 change-requests:
-  image: lblod/change-request-service:0.1.0
+  image: lblod/change-request-service:0.2.0
   environment:
     DEFAULT_MU_AUTH_SCOPE: "http://services.lblod.info/change-request-service"
-    APPLICATION_GRAPH: "http://mu.semte.ch/graphs/public"
+    APPLICATION_GRAPH: "http://mu.semte.ch/graphs/administrative-unit"
     CONFIG_FILE: "/config/change-requests/change-requests.json"
   volumes:
     - ./config/change-requests:/config/change-requests:ro

@@ -230,8 +230,9 @@ Run these against Virtuoso itself (in the app-lokale-verkenner development stack
 the form or `curl --data-urlencode query@file.rq`). Through the stack the change-requests graph is
 not readable: only the service's scope has it, by design. Each query carries its own prefixes and
 `FROM` lines, so it can be pasted as it is; replace `<request uuid>` and `<record uuid>` where they
-appear. Labels (statuses, step types, organisations) come from the public graph, the data from the
-change-requests graph. All of them pass the conductor's "strict checking of void variables".
+appear. The labels of statuses and step types come from the public graph, the names and current
+values of the organisations from the organisation graph (`administrative-unit`), the requests from
+the change-requests graph. All of them pass the conductor's "strict checking of void variables".
 
 ### All requests, newest first
 
@@ -253,6 +254,7 @@ PREFIX foaf: <http://xmlns.com/foaf/0.1/>
 SELECT ?uuid ?created ?status ?aggregate ?targetName ?requesterName ?person ?replacedBy
 FROM <http://mu.semte.ch/graphs/change-requests>
 FROM <http://mu.semte.ch/graphs/public>
+FROM <http://mu.semte.ch/graphs/administrative-unit>
 WHERE {
   ?request a cr:ChangeRequest ;
     mu:uuid ?uuid ;
@@ -294,6 +296,7 @@ PREFIX oslc:   <http://open-services.net/ns/core#>
 SELECT ?position ?type ?status ?at ?agent ?actingOrg ?rule ?reason ?error
 FROM <http://mu.semte.ch/graphs/change-requests>
 FROM <http://mu.semte.ch/graphs/public>
+FROM <http://mu.semte.ch/graphs/administrative-unit>
 WHERE {
   ?request a cr:ChangeRequest ; mu:uuid "<request uuid>" .
   ?step a cr:Action ;
@@ -363,6 +366,7 @@ PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
 SELECT ?stepType ?appliedAt ?record ?property ?old ?new
 FROM <http://mu.semte.ch/graphs/change-requests>
 FROM <http://mu.semte.ch/graphs/public>
+FROM <http://mu.semte.ch/graphs/administrative-unit>
 WHERE {
   ?request a cr:ChangeRequest ; mu:uuid "<request uuid>" .
   ?apply a cr:Action ; dct:isPartOf ?request ;
@@ -399,6 +403,7 @@ PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
 SELECT ?uuid ?created ?requester ?record ?operation ?property ?base ?proposed ?current
 FROM <http://mu.semte.ch/graphs/change-requests>
 FROM <http://mu.semte.ch/graphs/public>
+FROM <http://mu.semte.ch/graphs/administrative-unit>
 WHERE {
   VALUES ?status {
     <http://lblod.data.gift/concepts/d57aff85-43ce-4bd0-b962-6bd1b1fbc4b6>   # ingediend
@@ -506,6 +511,7 @@ PREFIX oslc: <http://open-services.net/ns/core#>
 SELECT ?requestUuid ?stepType ?at ?message
 FROM <http://mu.semte.ch/graphs/change-requests>
 FROM <http://mu.semte.ch/graphs/public>
+FROM <http://mu.semte.ch/graphs/administrative-unit>
 WHERE {
   ?step a cr:Action ; dct:isPartOf ?request ; dct:type/skos:prefLabel ?stepType ;
     prov:startedAtTime ?at ; task:error ?error .
@@ -525,6 +531,7 @@ PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
 SELECT ?status (COUNT(?request) AS ?requests)
 FROM <http://mu.semte.ch/graphs/change-requests>
 FROM <http://mu.semte.ch/graphs/public>
+FROM <http://mu.semte.ch/graphs/administrative-unit>
 WHERE { ?request a cr:ChangeRequest ; adms:status/skos:prefLabel ?status }
 GROUP BY ?status
 ```
@@ -560,6 +567,7 @@ SELECT ?requestUuid ?created ?requestStatus ?aggregate ?target ?requester ?submi
        ?linkFrom ?linkPredicate
 FROM <http://mu.semte.ch/graphs/change-requests>
 FROM <http://mu.semte.ch/graphs/public>
+FROM <http://mu.semte.ch/graphs/administrative-unit>
 WHERE {
   # VALUES ?requestUuid { "<request uuid>" }        # one request instead of all
 

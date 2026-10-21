@@ -51,7 +51,7 @@ sequenceDiagram
   else
     S->>P: write the request, its indiening step and the proposed versions (change-requests graph), read them back
     alt an edit, or ABB's own request without a conflict
-      S->>P: apply to the organisation data (public graph): goedkeuring and afhandeling by the service
+      S->>P: apply to the organisation data (organisation graph): goedkeuring and afhandeling by the service
       S->>P: read back what the apply wrote, then set the status
       S-->>F: 201, status afgehandeld
     else a registration by an organisation, or ABB's own with a conflict
@@ -223,8 +223,10 @@ history, ABB's queue, everything at once) are in [docs/data-model.md](docs/data-
 flowchart LR
   Browser -->|GET, JSON:API| Resources[mu-cl-resources]
   Browser -->|POST /change-requests| Service[change-request-service]
-  Resources -->|read| Public[("public graph<br/>organisation data")]
-  Service -->|scope: read + write| Public
+  Resources -->|read, logged in| Orgs[("organisation graph, administrative-unit<br/>organisation data")]
+  Resources -->|read| Public[("public graph<br/>code lists, mock-login accounts")]
+  Service -->|scope: read + write| Orgs
+  Service -->|scope: read| Public
   Service -->|scope: read + write| CR[("change-requests graph<br/>requests, steps, versions, states")]
   Service -->|scope: read| Sessions[("sessions graph")]
 ```
@@ -247,7 +249,7 @@ The sparql-parser configuration and the facts it rests on are in
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `DEFAULT_MU_AUTH_SCOPE` | `http://services.lblod.info/change-request-service` | the scope sparql-parser grants the writes to |
-| `APPLICATION_GRAPH` | `MU_APPLICATION_GRAPH` or `http://mu.semte.ch/application` | the graph of the organisation data (`http://mu.semte.ch/graphs/public` in app-lokale-verkenner) |
+| `APPLICATION_GRAPH` | `MU_APPLICATION_GRAPH` or `http://mu.semte.ch/application` | the graph of the organisation data (`http://mu.semte.ch/graphs/administrative-unit` in app-lokale-verkenner, as in OP) |
 | `CHANGE_REQUESTS_GRAPH` | `http://mu.semte.ch/graphs/change-requests` | the graph of the requests |
 | `MODEL_DIR` | `/config/resources` | the mu-cl-resources JSON model files |
 | `CONFIG_FILE` | `/config/change-requests.json` | the aggregates, what may be registered and by whom, the visibility and the ABB organisation (below) |
