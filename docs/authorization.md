@@ -18,7 +18,10 @@ All data lives in `http://mu.semte.ch/graphs/public` and every session carries t
 (define-graph organisation-data ("http://mu.semte.ch/graphs/public")
   ("org:Organization" -> _) ("besluit:Bestuurseenheid" -> _) ("regorg:RegisteredOrganization" -> _)
   ("org:Site" -> _) ("locn:Address" -> _) ("schema:ContactPoint" -> _) ("adms:Identifier" -> _)
-  ("generiek:GestructureerdeIdentificator" -> _))
+  ("generiek:GestructureerdeIdentificator" -> _)
+  ;; what a creation or a veranderingsgebeurtenis applies on approval
+  ("org:ChangeEvent" -> _) ("code:VeranderingsgebeurtenisResultaat" -> _) ("besluit:Besluit" -> _)
+  ("besluitvorming:Beslissingsactiviteit" -> _))
 
 (define-graph change-requests ("http://mu.semte.ch/graphs/change-requests" :delta nil)
   ("cr:ChangeRequest" -> _) ("cr:Action" -> _) ("cr:ProposedVersion" -> _) ("cr:RecordState" -> _)
@@ -83,26 +86,33 @@ uuid, requestingOrganisation, fullyCovered }, config }`.
 `policies/index.js` orders them; the first rule that answers decides, no answer means deny:
 
 ```js
-export const canEdit = [abbEditsAll, ownOrganisation];                 // an edit or a change event on an existing organisation, and hertoepassing
-export const canCreate = [abbEditsAll, mayCreateClassification];       // a new organisation of a classification the actor manages
-export const autoApprove = [editsApplyAtOnce, abbAutoApproves];        // edits always; creations and change events only ABB's own
-export const canDecide = [abbDecidesAll];                              // goedkeuring, afkeuring, informatievraag
-export const canReply = [requestingOrganisation];                      // informatieantwoord, betwisting
-export const canWithdraw = [abbEditsAll, requestingOrganisation];      // intrekking
-export const supersede = [supersededByOwnRequest];                     // older pending requests an apply withdraws
+export const canEdit = [abbEditsAll, ownOrganisation];                                   // an edit or a change event on an existing organisation
+export const canCreate = [abbEditsAll, mayCreateClassification];                         // a new organisation of a classification the actor manages
+export const autoApprove = [editsApplyAtOnce, conflictsWaitForReview, abbAutoApproves];  // edits always; creations and change events only ABB's own, without conflicts
+export const canReapply = [abbEditsAll, requestingOrganisation];                         // hertoepassing
+export const canDecide = [abbDecidesAll];                                                // goedkeuring, afkeuring, informatievraag
+export const canReply = [requestingOrganisation];                                        // informatieantwoord, betwisting
+export const canWithdraw = [abbEditsAll, requestingOrganisation];                        // intrekking
+export const supersede = [supersededByOwnRequest];                                       // older pending requests an apply withdraws
 ```
 
 - The permissions endpoint, the POST and the steps run the same lists; the rule that allowed or
   decided a step is recorded on it (`cr:rule`), under its kebab-case name (`own-organisation`,
-  `abb-edits-all`, `may-create-classification`, `edits-apply-at-once`, `abb-auto-approves`).
+  `abb-edits-all`, `may-create-classification`, `edits-apply-at-once`, `abb-auto-approves`,
+  `requesting-organisation`). `conflictsWaitForReview` only denies: ABB's own creation or change
+  event from a stale form waits for ABB's goedkeuring with the conflicts token, as anyone's would.
+- `can-create` without a target evaluates `canCreate` once without a classification: a rule that
+  allows that (ABB's `abbEditsAll`) lets the session request every classification of
+  `registration.types`.
 - `mayCreateClassification` reads `creatableClassifications` of the configuration: the
   classification of the acting organisation maps to the classifications it may request ("Wie
   beheert": a gemeente an AGB, an OCMW a welzijnsvereniging, ...).
 - Who sees a request is not a rule list but a filter on the listing: with `pendingVisibleTo`
-  `everyone` (the default) every logged-in user sees every request; with `involved` an
-  organisation sees the requests about it, those it submitted and the applied ones, and ABB all.
-  Whoever sees a request, the person who submitted it and the texts of its steps (questions,
-  answers, reasons) are shown to the requesting organisation and ABB only.
+  `everyone` every logged-in user sees every request; with `involved` an organisation sees the
+  requests about it, those it submitted and the decided ones, and ABB all. Whoever sees a request,
+  the person who submitted it, the texts of its steps (questions, answers, reasons) and the error
+  of a failed apply are shown to the requesting organisation and ABB only. The list leaves edits
+  out unless `filter[kind]` asks for them.
 - Later rules slot in without touching the flow: `memberOfTargetPartnership`,
   `targetTypeIn([...])`, `aggregateIn([...])`. Holding a request that another pending request
   competes with is a one-line rule (`ctx.competing.length ? 'deny' : undefined`). The service does

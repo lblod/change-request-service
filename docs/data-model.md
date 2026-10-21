@@ -92,8 +92,8 @@ proposed version until then.
 
 ## Example
 
-A request the service approved at once, with its two steps, its versions, the states they started
-from and the state the approval replaced:
+An edit the service approved and applied at once, with its three steps, its versions, the states
+they started from and the states the apply replaced:
 
 ```turtle
 @prefix cr: <http://lblod.data.gift/vocabularies/change-requests/> .
@@ -102,7 +102,7 @@ from and the state the approval replaced:
 <http://data.lblod.info/id/change-requests/f6c30f3b-af3e-4f7f-8ec3-11ec48093b5f> a cr:ChangeRequest ;
   mu:uuid "f6c30f3b-af3e-4f7f-8ec3-11ec48093b5f" ;
   dct:created "2026-11-03T10:12:00Z"^^xsd:dateTime ;
-  adms:status <http://lblod.data.gift/concepts/ca080d1f-f71c-4fe6-a4ed-a13fe1112989> ;   # goedgekeurd: the status of the last step
+  adms:status <http://lblod.data.gift/concepts/362d4aee-2fe3-45b3-a7ef-8602b8516bf0> ;   # afgehandeld: the status of the last step, set once the apply was read back
   cr:aggregate "organization-core-data" ;
   cr:target <http://data.lblod.info/id/bestuurseenheden/9a01f3e2-4c7b-4d2a-9f1e-0a1b2c3d4e5f> ;
   pav:createdBy <http://data.lblod.info/id/bestuurseenheden/9a01f3e2-4c7b-4d2a-9f1e-0a1b2c3d4e5f> ;   # the requesting organisation
@@ -126,11 +126,20 @@ from and the state the approval replaced:
   mu:uuid "36166629-4a16-4dcf-9eeb-1054baa34ee0" ;
   dct:isPartOf <http://data.lblod.info/id/change-requests/f6c30f3b-af3e-4f7f-8ec3-11ec48093b5f> ;
   dct:type <http://lblod.data.gift/concepts/bb2bb632-fc9f-41c6-a1eb-8f50e4008551> ;      # goedkeuring
-  adms:status <http://lblod.data.gift/concepts/ca080d1f-f71c-4fe6-a4ed-a13fe1112989> ;   # goedgekeurd
+  adms:status <http://lblod.data.gift/concepts/ca080d1f-f71c-4fe6-a4ed-a13fe1112989> ;   # goedgekeurd: the decision
   schema:position 2 ;
   prov:startedAtTime "2026-11-03T10:12:01Z"^^xsd:dateTime ;
   prov:wasAssociatedWith <http://lblod.data.gift/services/change-request-service> ;    # taken by the service
-  cr:rule "always" ;                                                                    # the autoApprove rule
+  cr:rule "edits-apply-at-once" .                                                       # the autoApprove rule
+
+<http://data.lblod.info/id/change-request-actions/bf9dc953-61f2-4316-b0da-4a0ecd2916fa> a cr:Action ;
+  mu:uuid "bf9dc953-61f2-4316-b0da-4a0ecd2916fa" ;
+  dct:isPartOf <http://data.lblod.info/id/change-requests/f6c30f3b-af3e-4f7f-8ec3-11ec48093b5f> ;
+  dct:type <http://lblod.data.gift/concepts/7f55ec41-b1fe-4145-acf1-15cb2cb13cd2> ;      # afhandeling: the apply
+  adms:status <http://lblod.data.gift/concepts/362d4aee-2fe3-45b3-a7ef-8602b8516bf0> ;   # afgehandeld
+  schema:position 3 ;
+  prov:startedAtTime "2026-11-03T10:12:01Z"^^xsd:dateTime ;
+  prov:wasAssociatedWith <http://lblod.data.gift/services/change-request-service> ;
   prov:invalidated <http://data.lblod.info/id/record-states/4d4d58ca-b401-45e2-b124-f14e75824f01>,   # the states it replaced
                    <http://data.lblod.info/id/record-states/a25dd05e-c96b-41e1-ae8e-ff4b86d3983b> .
 
@@ -186,17 +195,23 @@ from and the state the approval replaced:
   rdf:object <http://data.lblod.info/id/contact-punten/c0ffee12-3456-4789-8abc-def012345678> .
 ```
 
-The state the approval replaced for the tombstone (`a25d…`) has the shape of its base state, as the
-contact point and its links were when it was deleted. A goedkeuring by ABB whose apply failed, and
-an older request a newer one replaced:
+The state the apply replaced for the tombstone (`a25d…`) has the shape of its base state, as the
+contact point and its links were when it was deleted. A goedkeuring by ABB whose apply failed (the
+goedkeuring stays the decision; the afhandeling that tried the apply is recorded, under a step of
+its own, with status mislukt and the error), and an older request a newer one replaced:
 
 ```turtle
 <http://data.lblod.info/id/change-request-actions/3e4825fa-0dcf-4a46-9e95-66edf24d4eb0> a cr:Action ;
   dct:type <http://lblod.data.gift/concepts/bb2bb632-fc9f-41c6-a1eb-8f50e4008551> ;      # goedkeuring
-  adms:status <http://lblod.data.gift/concepts/b610e2dc-902c-4874-b65e-78b7f6411c05> ;   # mislukt
+  adms:status <http://lblod.data.gift/concepts/ca080d1f-f71c-4fe6-a4ed-a13fe1112989> ;   # goedgekeurd
   prov:wasAssociatedWith <http://data.lblod.info/id/persoon/3a4b5c6d-7e8f-4a9b-8c1d-2e3f4a5b6c7d> ;   # ABB's person
   cr:actingOrganisation <http://data.lblod.info/id/bestuurseenheden/141d9d6b-54af-4d17-b313-8d1c30bc3f5b> ;
-  cr:rule "abb-decides-all" ;
+  cr:rule "abb-decides-all" ; … .
+
+<http://data.lblod.info/id/change-request-actions/069d6bb2-e8e1-4553-b606-74784d672161> a cr:Action ;
+  dct:type <http://lblod.data.gift/concepts/7f55ec41-b1fe-4145-acf1-15cb2cb13cd2> ;      # afhandeling
+  adms:status <http://lblod.data.gift/concepts/b610e2dc-902c-4874-b65e-78b7f6411c05> ;   # mislukt: the request too
+  prov:wasAssociatedWith <http://lblod.data.gift/services/change-request-service> ;
   task:error <http://redpencil.data.gift/id/jobs/error/0e85ca4a-4b6b-4954-8ba3-8b0bd7fe5cc0> ; … .
 
 <http://redpencil.data.gift/id/jobs/error/0e85ca4a-4b6b-4954-8ba3-8b0bd7fe5cc0> a oslc:Error ;
@@ -220,7 +235,10 @@ change-requests graph. All of them pass the conductor's "strict checking of void
 
 ### All requests, newest first
 
-Add `FILTER(?targetName = "Aalst")` or `?request adms:status/skos:prefLabel "Ingediend"` to narrow.
+Add `FILTER(?targetName = "Aalst")` or `?request adms:status/skos:prefLabel "Ingediend"` to narrow,
+or `FILTER(?aggregate IN ("new-organisation", "change-event"))` for what the overviews list (the
+edits are the history of the data). A creation that waits has no organisation in the register yet:
+its name comes from the version that proposes it.
 
 ```sparql
 PREFIX cr:   <http://lblod.data.gift/vocabularies/change-requests/>
@@ -229,6 +247,7 @@ PREFIX dct:  <http://purl.org/dc/terms/>
 PREFIX adms: <http://www.w3.org/ns/adms#>
 PREFIX pav:  <http://purl.org/pav/>
 PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX prov: <http://www.w3.org/ns/prov#>
 PREFIX foaf: <http://xmlns.com/foaf/0.1/>
 
 SELECT ?uuid ?created ?status ?aggregate ?targetName ?requesterName ?person ?replacedBy
@@ -240,9 +259,15 @@ WHERE {
     dct:created ?created ;
     adms:status/skos:prefLabel ?status ;
     cr:aggregate ?aggregate ;
-    cr:target/skos:prefLabel ?targetName ;
+    cr:target ?target ;
     pav:createdBy/skos:prefLabel ?requesterName ;
     dct:creator ?creator .
+  OPTIONAL { ?target skos:prefLabel ?registeredName }
+  OPTIONAL {
+    ?submission dct:isPartOf ?request ; prov:generated ?proposal .
+    ?proposal dct:isVersionOf ?target ; skos:prefLabel ?proposedName .
+  }
+  BIND(COALESCE(?registeredName, ?proposedName) AS ?targetName)
   OPTIONAL { ?creator foaf:firstName ?first ; foaf:familyName ?last }
   OPTIONAL { ?request dct:isReplacedBy/mu:uuid ?replacedBy }
   BIND(COALESCE(CONCAT(?first, " ", ?last), STR(?creator)) AS ?person)
@@ -355,9 +380,12 @@ ORDER BY ?record ?property
 
 ### The pending requests, with the live picture
 
-Every request that waits for ABB, per field: its base, its proposal and what the record holds now.
-A single-valued field is in conflict where `current` differs from both `base` and `proposed`. This
-is what the service computes on every `GET`; it is not stored.
+Every request that waits for ABB (ingediend or informatie gevraagd), per field: its base, its
+proposal and what the record holds now. A single-valued field is in conflict where `current`
+differs from both `base` and `proposed`. This is what the service computes on every `GET`; it is
+not stored. The records a request creates (the organisation of a creation, its identifiers, the
+change event) have no base and change no field of an existing record: they show every value they
+propose, with `operation` Create.
 
 ```sparql
 PREFIX cr:   <http://lblod.data.gift/vocabularies/change-requests/>
@@ -368,20 +396,33 @@ PREFIX prov: <http://www.w3.org/ns/prov#>
 PREFIX pav:  <http://purl.org/pav/>
 PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
 
-SELECT ?uuid ?created ?requester ?record ?property ?base ?proposed ?current
+SELECT ?uuid ?created ?requester ?record ?operation ?property ?base ?proposed ?current
 FROM <http://mu.semte.ch/graphs/change-requests>
 FROM <http://mu.semte.ch/graphs/public>
 WHERE {
+  VALUES ?status {
+    <http://lblod.data.gift/concepts/d57aff85-43ce-4bd0-b962-6bd1b1fbc4b6>   # ingediend
+    <http://lblod.data.gift/concepts/f628da38-1583-4bfc-b3f3-eb41a7708944>   # informatie-gevraagd
+  }
   ?request a cr:ChangeRequest ;
     mu:uuid ?uuid ;
     dct:created ?created ;
-    adms:status/skos:prefLabel "Ingediend" ;
+    adms:status ?status ;
     pav:createdBy/skos:prefLabel ?requester .
   ?submission a cr:Action ; dct:isPartOf ?request ; prov:generated ?version .
-  ?version dct:isVersionOf ?record ; cr:changesProperty ?property .
-  OPTIONAL { ?version cr:base ?baseState . ?baseState ?property ?base }
-  OPTIONAL { ?version ?property ?proposed }
-  OPTIONAL { ?record ?property ?current }
+  ?version dct:isVersionOf ?record ; cr:operation ?operation .
+  {
+    ?version cr:changesProperty ?property .
+    OPTIONAL { ?version cr:base ?baseState . ?baseState ?property ?base }
+    OPTIONAL { ?version ?property ?proposed }
+    OPTIONAL { ?record ?property ?current }
+  }
+  UNION
+  {
+    ?version cr:operation <https://www.w3.org/ns/activitystreams#Create> ;
+      ?property ?proposed .
+    FILTER(!STRSTARTS(STR(?property), STR(cr:)) && ?property NOT IN (<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>, mu:uuid, dct:isVersionOf, prov:generatedAtTime))
+  }
 }
 ORDER BY ?created ?record ?property
 ```

@@ -14,11 +14,22 @@ Detail lives in `docs/`: [API](docs/api.md), [what is stored](docs/data-model.md
   are read-only. This service is the only writer, through a sparql-parser scope. No sudo.
 - **A request tells a story.** It carries a trail of steps (indiening, informatievraag,
   informatieantwoord, goedkeuring, afhandeling, afkeuring, betwisting, intrekking, hertoepassing):
-  who did what, when, and under which rule. Its status is the status of its last step.
+  who did what, when, and under which rule. Its status follows its last step, and is set only once
+  what the step wrote is read back.
 - **Edits apply at once, registrations wait.** An organisation's edit of its own data is applied
   right away; nothing waits. A request to register a new organisation or a veranderingsgebeurtenis
   waits for ABB, who approves it, rejects it with a reason or asks the requester for information;
-  the requester answers, or contests a rejection. What ABB requests itself is applied at once.
+  the requester answers, or contests a rejection. What ABB requests itself is applied at once,
+  unless it conflicts with a newer value: then it waits for ABB's goedkeuring like any other.
+- **Edits are history, not requests to act on.** They are kept, with every value they changed, but
+  the list leaves them out unless asked (`filter[kind]=edit`); an edit that changes nothing is not
+  stored at all.
+- **Each form changes its own fields only.** Per aggregate the configuration says which fields of
+  an organisation it may change: the kerngegevens not the werkingsgebied, the juridische vorm or the
+  bijkomende kwalificaties (those change through a veranderingsgebeurtenis), a vestiging only the
+  sites. A request registers only the organisation types the service registers, as the resource
+  type configured for them, with exactly one oprichting, and a KBO number nobody holds: checked at
+  submission, at approval and when a rejection is contested, under a lock per number.
 - **Stale forms are refused.** With every update the frontend sends the values its form started
   from. A field somebody else changed in the meantime is a conflict: an edit with a conflict is
   refused (409) so the form reloads; a request that waits shows its conflicts to ABB, who
@@ -38,11 +49,12 @@ sequenceDiagram
   alt an edit with a conflict
     S-->>F: 409 with the conflicts: nothing saved, the form reloads
   else
-    S->>P: write the request, its indiening step and the proposed versions (change-requests graph)
-    alt an edit, or ABB's own registration
+    S->>P: write the request, its indiening step and the proposed versions (change-requests graph), read them back
+    alt an edit, or ABB's own request without a conflict
       S->>P: apply to the organisation data (public graph): goedkeuring and afhandeling by the service
+      S->>P: read back what the apply wrote, then set the status
       S-->>F: 201, status afgehandeld
-    else a registration by an organisation
+    else a registration by an organisation, or ABB's own with a conflict
       S-->>F: 201, status ingediend: the request waits for ABB
     end
   end
@@ -71,7 +83,7 @@ stateDiagram-v2
   ingediend --> informatie_gevraagd: informatievraag (ABB, with a question)
   informatie_gevraagd --> ingediend: informatieantwoord (the requester, with the answer)
   ingediend --> goedgekeurd: goedkeuring (ABB, or the service for an edit or ABB's own request)
-  goedgekeurd --> afgehandeld: afhandeling (the service applies it, in the same update)
+  goedgekeurd --> afgehandeld: afhandeling (the service applies it, with the goedkeuring)
   goedgekeurd --> mislukt: afhandeling whose apply failed
   ingediend --> afgekeurd: afkeuring (ABB, with a reason)
   informatie_gevraagd --> afgekeurd: afkeuring
@@ -100,9 +112,15 @@ stateDiagram-v2
 - **Replace**: a request that is applied withdraws the older pending requests of the same
   organisation whose every field it rewrote (the service takes the intrekking and records
   `dct:isReplacedBy`).
-- **Fail and retry**: the apply is one SPARQL update, idempotent but not one transaction. When it
-  fails twice the afhandeling is kept with status `mislukt` and an error (the goedkeuring stays),
-  and a hertoepassing applies the stored versions again.
+- **Fail and retry**: the apply is one SPARQL update, idempotent but not one transaction:
+  sparql-parser sends it in several requests and does not always report one that failed. So the
+  service reads back what the apply wrote and only then sets the status, adding the new status
+  before it removes the old one. An apply that fails or comes back incomplete is run once more;
+  when that fails too the failure is kept as an afhandeling with status `mislukt` and an error (the
+  goedkeuring stays), and a hertoepassing, by ABB or the organisation that submitted the request,
+  applies the stored versions again. A submission is read back the same way.
+- An edit takes none of the validation steps: after a failed apply only a hertoepassing or an
+  intrekking.
 - `afgehandeld` and `ingetrokken` are final; `afgekeurd` is not, since a rejection can be contested.
 
 ## Finding conflicts
@@ -137,10 +155,10 @@ flowchart TD
 
 | Call | What it does |
 | --- | --- |
-| `POST /change-requests` | Submit the new state of one aggregate: an edit (201, status `afgehandeld`, or 409 with its conflicts), a new organisation or a veranderingsgebeurtenis (201, status `ingediend`: it waits for ABB). |
-| `GET /change-requests?filter[kind]=&filter[mine]=true&filter[requester]=&filter[target]=&filter[target-classification]=&filter[status]=&filter[created][gte]=&sort=&page[number]=&page[size]=` | Every request (everyone who is logged in sees all), oldest first, paged and filtered. |
+| `POST /change-requests` | Submit the new state of one aggregate: an edit (201, status `afgehandeld`, or 409 with its conflicts; 200 and nothing stored when it changes nothing), a new organisation or a veranderingsgebeurtenis (201, status `ingediend`: it waits for ABB). |
+| `GET /change-requests?filter[kind]=&filter[mine]=true&filter[requester]=&filter[target]=&filter[target-classification]=&filter[status]=&filter[created][gte]=&sort=&page[number]=&page[size]=` | The requests that go through validation (creations and change events; edits only with `filter[kind]=edit`), everyone who is logged in sees all, oldest first, paged and filtered. |
 | `GET /change-requests/:id` | One request with its steps, the operations it submitted, its live conflicts and competing requests. |
-| `POST /change-requests/:id/steps` | A step: `goedkeuring`, `afkeuring` or `informatievraag` (ABB), `informatieantwoord` or `betwisting` (the requester), `intrekking` (requester or ABB), `hertoepassing` (after a failed apply). |
+| `POST /change-requests/:id/steps` | A step: `goedkeuring`, `afkeuring` or `informatievraag` (ABB), `informatieantwoord` or `betwisting` (the requester), `intrekking` (requester or ABB), `hertoepassing` (after a failed apply, requester or ABB). |
 | `GET /change-requests/permissions?target=` | Whether the logged-in organisation may edit the target and register events about it, whether it decides; without `target`, which organisations it may request. |
 
 A request body carries an aggregate, a target and ordered JSON:API operations; each update may
@@ -157,9 +175,12 @@ carry its base in `meta.base`:
 
 Rules in one breath: every id must belong to the target's aggregate; an organisation is only ever
 updated, and only the target itself, except that a creation creates exactly one; a create carries a
-`lid` that other operations may point at; a relationship outside the aggregate may be carried but
-not changed; a creation has no target and carries the KBO number of an organisation that is not
-registered yet. Everything else, with the status codes, is in [docs/api.md](docs/api.md).
+`lid` that other operations may point at, and must be linked to the organisation through the
+records of the request; a field the aggregate may not change (a relationship outside it, a field
+its `writable` leaves out) may be carried but not changed; a creation has no target and carries
+the KBO number of an organisation that is not registered yet (an ILV or a vervoerregioraad may go
+without); a record another organisation still links to cannot be deleted; at most 100 operations
+and 100 values per field. Everything else, with the status codes, is in [docs/api.md](docs/api.md).
 
 ## What is stored
 
@@ -229,38 +250,54 @@ The sparql-parser configuration and the facts it rests on are in
 | `APPLICATION_GRAPH` | `MU_APPLICATION_GRAPH` or `http://mu.semte.ch/application` | the graph of the organisation data (`http://mu.semte.ch/graphs/public` in app-lokale-verkenner) |
 | `CHANGE_REQUESTS_GRAPH` | `http://mu.semte.ch/graphs/change-requests` | the graph of the requests |
 | `MODEL_DIR` | `/config/resources` | the mu-cl-resources JSON model files |
-| `CONFIG_FILE` | `/config/change-requests.json` | the aggregates, who may request what, the visibility and the ABB organisation (below) |
+| `CONFIG_FILE` | `/config/change-requests.json` | the aggregates, what may be registered and by whom, the visibility and the ABB organisation (below) |
 | `MAX_BODY_SIZE` | `5mb` in the image (the template's default is `100kb`) | body limit; a mounted development checkout must set it itself |
 | `SPARQL_MAX_ROWS` | `10000` | Virtuoso's row limit; queries are batched to stay under it |
 
 ```json
 {
   "aggregates": {
-    "organization-core-data": { "kind": "edit", "root": "organizations", "members": ["addresses", "contact-points", "sites", "structured-identifiers", "identifiers"], "references": ["locations", "concepts", "site-types"] },
-    "site": { "kind": "edit", "root": "sites", "members": ["addresses", "contact-points", "organizations"], "references": ["site-types", "concepts"] },
-    "new-organisation": { "kind": "creation", "root": "organizations", "members": ["identifiers", "structured-identifiers", "sites", "addresses", "contact-points", "change-events", "decisions"], "references": ["organization-classification-codes", "organization-status-codes", "concepts", "locations", "site-types", "change-event-types"] },
-    "change-event": { "kind": "change-event", "root": "change-events", "members": ["change-event-results", "decisions", "decision-activities", "organizations"], "references": ["change-event-types", "organization-status-codes", "concepts", "locations"] }
+    "organization-core-data": { "kind": "edit", "root": "organizations", "members": ["addresses", "contact-points", "sites", "structured-identifiers", "identifiers"], "references": ["locations", "concepts", "site-types"],
+      "writable": { "organizations": ["name", "legal-name", "alternative-name", "purpose", "expected-end-date", "content-themes", "identifiers", "primary-site", "sites"] } },
+    "site": { "kind": "edit", "root": "sites", "members": ["addresses", "contact-points", "organizations"], "references": ["site-types", "concepts"],
+      "writable": { "organizations": ["sites", "primary-site"] } },
+    "new-organisation": { "kind": "creation", "root": "organizations", "members": ["identifiers", "structured-identifiers", "sites", "addresses", "contact-points", "change-events", "change-event-results", "decisions"], "references": ["organization-classification-codes", "organization-status-codes", "concepts", "locations", "site-types", "change-event-types"] },
+    "change-event": { "kind": "change-event", "root": "change-events", "members": ["change-event-results", "decisions", "decision-activities", "organizations"], "references": ["change-event-types", "organization-status-codes", "concepts", "locations"],
+      "writable": { "organizations": ["name", "legal-name", "organization-status", "legal-form", "scope", "additional-qualifications"] } }
+  },
+  "registration": {
+    "types": { "administrative-units": ["<gemeente>", "<AGB>", "<ILV>", "…"], "registered-organizations": ["<ziekenhuisvereniging>", "<zorgraad>", "…"] },
+    "foundingEventType": "http://lblod.data.gift/concepts/f0e2706a-3b64-4464-ad9c-4e65dc976288",
+    "kboOptional": ["<ILV>", "<vervoerregioraad>"]
   },
   "creatableClassifications": { "<classification of a gemeente>": ["<AGB>", "<projectvereniging>", "…"], "<OCMW>": ["…"] },
   "pendingVisibleTo": "everyone",
-  "abbUri": "http://data.lblod.info/id/bestuurseenheden/141d9d6b-54af-4d17-b313-8d1c30bc3f5b",
-  "statusScheme": "http://lblod.data.gift/concept-schemes/e8274055-0834-4511-8b84-a2af41055633"
+  "abbUri": "http://data.lblod.info/id/bestuurseenheden/141d9d6b-54af-4d17-b313-8d1c30bc3f5b"
 }
 ```
 
 An aggregate is a whitelist: `root` and `members` are the types a request may create, update and
-delete; `references` are code lists a record may link to but never change; `kind` says whether it
-is an `edit` (applied at once), a `creation` (a new organisation, whose root must be the
-organisation type) or a `change-event`. `creatableClassifications` is the "Wie beheert" table:
-which classification an organisation may request, by the classification it has itself.
-`pendingVisibleTo` is `everyone` (the default) or `involved`: who sees a request that still waits.
-A new field only needs the resources model and the frontend; a new type is added to its aggregate.
+delete; `references` are code lists a record may link to but never change; `kind` (required) says
+whether it is an `edit` (applied at once), a `creation` (a new organisation, whose root must be the
+organisation type) or a `change-event`. `writable` narrows, per type, the fields the aggregate may
+change on a record that exists; any other field may be carried, but unchanged. `registration` lists
+every classification the service registers, by the resource type it registers it as (ABB may
+request all of them), the change-event type of the oprichting every creation carries, and the
+classifications registered without a KBO number. `creatableClassifications` is the "Wie beheert"
+table: which classification an organisation may request, by the classification it has itself.
+`pendingVisibleTo` (required) is `everyone` or `involved`: who sees a request that still waits.
+Nothing has a default that widens what a request may do: a missing `kind` or `pendingVisibleTo` stops
+the service at start-up. app-lokale-verkenner keeps the same file in
+`config/change-requests/change-requests.json`; the two copies must be equal. A new field only needs
+the resources model and the frontend (and the `writable` list of its aggregate, where it has one); a
+new type is added to its aggregate.
 
 ## Development
 
 ```sh
-npm run setup    # once: the template's node_modules and its `mu` helper (needs docker)
-npm test         # 175 unit tests against OP's model; MODEL_DIR=../app-lokale-verkenner/config/resources npm test for app-lokale-verkenner's
+npm run setup    # once: the template's node_modules, its `mu` helper and the dev dependencies (needs docker)
+npm test         # 207 unit tests against OP's model, every query they send parsed as SPARQL 1.1;
+                 # MODEL_DIR=../app-lokale-verkenner/config/resources npm test for app-lokale-verkenner's
 scripts/e2e-mock-login.sh   # the whole flow against a running app-lokale-verkenner (mock-login as two gemeenten and ABB)
 ```
 
@@ -278,7 +315,12 @@ How app-lokale-verkenner runs the service, the test fixtures, the datatype table
   samenvoeging) are not requests yet.
 - A creation needs the KBO number of a registered organisation; a lookup in the KBO is not built.
 - A `mislukt` request can be rejected or withdrawn while its half-run apply may have left a
-  record stripped; the recorded replaced states would allow a restore step.
+  record stripped (or a creation half written); the recorded replaced states would allow a restore
+  step.
+- Which fields a change event may change does not depend on its type yet: a "Wijziging
+  werkingsgebied" could change the name too. ABB sees the operations before approving.
+- sparql-parser 0.0.15 drops a batch of an update that keeps failing without reporting it; the
+  service reads its writes back to notice, but the cause belongs upstream.
 - The lock per organisation is in-process: one service instance.
 - The pages send no base on a delete yet, so a delete is only checked against changes since it was
   submitted.
