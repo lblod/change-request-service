@@ -37,6 +37,14 @@ export const mayCreateClassification = async (ctx) => {
 /** An edit of the records of an organisation that exists (kind edit) is applied at once: no validation. */
 export const editsApplyAtOnce = async (ctx) => (ctx.kind === 'edit' ? 'allow' : undefined);
 
+/**
+ * A request that conflicts with what changed since its form was loaded waits, also ABB's own: it
+ * is applied by a goedkeuring that overrides exactly those conflicts (the conflicts token), so an
+ * older form never overwrites newer values unseen. Edits never get here: a conflicting edit is
+ * refused before (409).
+ */
+export const conflictsWaitForReview = async (ctx) => (ctx.conflicts?.length ? 'deny' : undefined);
+
 /** What ABB requests itself (a new organisation, a change event) is applied at once; anyone else's request waits for ABB. */
 export const abbAutoApproves = async (ctx) => (ctx.actor.uri === ctx.config.abbUri ? 'allow' : undefined);
 

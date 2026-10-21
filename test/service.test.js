@@ -1694,6 +1694,19 @@ test('a change-event request carries exactly one change event, about the organis
   await assert.rejects(() => service(fakeDb()).create(sessions.orgA, body(IDS.org, 'change-event', elsewhere)), { status: 422 });
 });
 
+test('ABB\'s own change event from a stale form waits for ABB\'s goedkeuring with the token instead of overwriting newer values', async () => {
+  const db = fakeDb({ master: withName('Aalst (B)') });
+  const { status, document } = await service(db).create(sessions.abb, body(IDS.org, 'change-event', changeEventOperations('Aalst (ABB)')));
+  assert.equal(status, 201);
+  assert.equal(document.attributes.status, 'ingediend', 'held: a conflict on the name');
+  assert.deepEqual(document.attributes.conflicts.map(({ key, base, current, proposed }) => [key, base, current, proposed]), [['name', 'Aalst', 'Aalst (B)', 'Aalst (ABB)']]);
+  assert.ok(document.attributes['conflicts-token']);
+  assert.equal(writes(db).length, 1, 'stored, not applied');
+  // without a conflict ABB's change event is applied at once
+  const fresh = fakeDb();
+  assert.equal((await service(fresh).create(sessions.abb, body(IDS.org, 'change-event', changeEventOperations('Aalst (ABB)')))).document.attributes.status, 'afgehandeld');
+});
+
 test('a step that leaves a request waiting answers with its live conflicts and token, as a GET does', async () => {
   const db = pendingDb({ master: withName('Aalst (ABB)'), onUpdate: recordSteps });
   const { document } = await service(db).addStep(sessions.abb, RID(5), step('informatievraag', { reason: 'Welk besluit?' }));

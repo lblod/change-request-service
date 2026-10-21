@@ -3,6 +3,7 @@ import {
   ownOrganisation,
   mayCreateClassification,
   editsApplyAtOnce,
+  conflictsWaitForReview,
   abbAutoApproves,
   abbDecidesAll,
   requestingOrganisation,
@@ -16,8 +17,9 @@ export const canEdit = [abbEditsAll, ownOrganisation];
 // Who may request a new organisation of the classification the request proposes.
 export const canCreate = [abbEditsAll, mayCreateClassification];
 // Whether a submitted request is applied at once (a goedkeuring by the service) or waits for ABB:
-// edits always, creations and change events only ABB's own.
-export const autoApprove = [editsApplyAtOnce, abbAutoApproves];
+// edits always, creations and change events only ABB's own, and those only when they conflict
+// with nothing (ABB then approves them on the request with the conflicts token).
+export const autoApprove = [editsApplyAtOnce, conflictsWaitForReview, abbAutoApproves];
 // Who applies a request whose apply failed again (hertoepassing): ABB and the organisation that
 // submitted it, whatever the request's kind.
 export const canReapply = [abbEditsAll, requestingOrganisation];
