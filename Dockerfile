@@ -10,3 +10,8 @@ ENV DEFAULT_MU_AUTH_SCOPE="http://services.lblod.info/change-request-service"
 # is 100kb). A stack that runs the template image with the sources mounted (development mode)
 # does not get this ENV and must set it in its docker-compose.
 ENV MAX_BODY_SIZE="5mb"
+
+# The template logs every query and the authorization headers by default: the values people
+# submit and their session ids. Off in the image; a stack that wants them sets these again.
+ENV LOG_SPARQL_ALL="false"
+ENV DEBUG_AUTH_HEADERS="false"
