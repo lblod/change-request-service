@@ -143,7 +143,7 @@ create_site_body() {
 
 request POST "/change-requests" "$SESSION_ORG_A" "$(create_site_body "$ORG_A_UUID" "$SITES_OF_A")"
 expect "organisation A creates a site under itself and links it: 201, applied" 201 \
-  '.data.type == "change-requests" and .data.attributes.status == "goedgekeurd" and .data.attributes["applied-at"] != null and .data.attributes.aggregate == "site" and (.data.attributes.lids | has("a1") and has("c1") and has("s1")) and .data.relationships.target.data.id == "'"$ORG_A_UUID"'"'
+  '.data.type == "change-requests" and .data.attributes.status == "afgehandeld" and .data.attributes["applied-at"] != null and .data.attributes.aggregate == "site" and (.data.attributes.lids | has("a1") and has("c1") and has("s1")) and .data.relationships.target.data.id == "'"$ORG_A_UUID"'"'
 REQUEST_ID=$(echo "$BODY" | jq -r '.data.id // empty')
 SITE_UUID=$(echo "$BODY" | jq -r '.data.attributes.lids.s1 // empty')
 ADDRESS_UUID=$(echo "$BODY" | jq -r '.data.attributes.lids.a1 // empty')
@@ -168,10 +168,10 @@ fi
 
 if [ -n "$REQUEST_ID" ]; then
   request GET "/change-requests/$REQUEST_ID" "$SESSION_ORG_A"
-  expect "organisation A reads its request" 200 '.data.id == "'"$REQUEST_ID"'" and .data.attributes.status == "goedgekeurd"'
+  expect "organisation A reads its request" 200 '.data.id == "'"$REQUEST_ID"'" and .data.attributes.status == "afgehandeld"'
 
   request GET "/change-requests/$REQUEST_ID" "$SESSION_ORG_B"
-  expect "organisation B does not see the request of A" 404 '.errors[0].status == "404"'
+  expect "organisation B sees the request of A too (everyone sees every request), without the person" 200 '.data.id == "'"$REQUEST_ID"'" and .data.attributes.steps[0].person == null'
 
   request GET "/change-requests/$REQUEST_ID" "$SESSION_ABB"
   expect "ABB sees the request of A" 200 '.data.id == "'"$REQUEST_ID"'"'
@@ -183,7 +183,7 @@ if [ -n "$REQUEST_ID" ]; then
   expect "the list of A is empty for B, not an error" 200 '.data == []'
 
   request POST "/change-requests/$REQUEST_ID/apply" "$SESSION_ORG_A"
-  expect "an applied request cannot be applied again: 409" 409 '.errors[0].status == "409" and (.errors[0].detail | test("has status goedgekeurd"))'
+  expect "an applied request cannot be applied again: 409" 409 '.errors[0].status == "409" and (.errors[0].detail | test("has status afgehandeld"))'
 
   request POST "/change-requests/00000000-0000-4000-8000-000000000000/apply" "$SESSION_ORG_A"
   expect "applying an unknown request is a 404" 404 '.errors[0].status == "404"'
@@ -253,7 +253,7 @@ fi
 request POST "/change-requests" "$SESSION_ORG_A" "$(cr_body "$ORG_A_UUID" organization-core-data '[
     { "op": "update", "data": { "type": "administrative-units", "id": "'"$ORG_A_UUID"'",
       "relationships": { "organization-status": { "data": null } } } } ]')"
-expect "clearing the status, which the aggregate does not admit, is a 422" 422 '.errors[0].status == "422" and (.errors[0].detail | test("not part of the aggregate")) and .errors[0].source.pointer == "/data/attributes/operations/0/data/relationships/organization-status"'
+expect "clearing the status, which the aggregate does not admit, is a 422" 422 '.errors[0].status == "422" and (.errors[0].detail | test("cannot be changed through the aggregate")) and .errors[0].source.pointer == "/data/attributes/operations/0/data/relationships/organization-status"'
 
 # the body limit of the template parser (MAX_BODY_SIZE, 5mb in the Dockerfile and the stack)
 head -c 6000000 /dev/zero | tr '\0' 'x' > "$TMP/padding"
@@ -283,7 +283,7 @@ if [ -n "$SITE_UUID" ]; then
   request POST "/change-requests" "$SESSION_ORG_A" "$(cr_body "$ORG_A_UUID" site '[
       { "op": "update", "data": { "type": "sites", "id": "'"$SITE_UUID"'",
         "attributes": { "site-type-name": "Integration test site, renamed" } } } ]')"
-  expect "organisation A updates the site, carrying only the name" 201 '.data.attributes.status == "goedgekeurd" and .data.attributes.lids == {}'
+  expect "organisation A updates the site, carrying only the name" 201 '.data.attributes.status == "afgehandeld" and .data.attributes.lids == {}'
   check_data "the site carries the new name and still its address and contact point (per-key semantics)" "
     PREFIX org: <http://www.w3.org/ns/org#> PREFIX mu: <http://mu.semte.ch/vocabularies/core/>
     PREFIX organisatie: <https://data.vlaanderen.be/ns/organisatie#> PREFIX dct: <http://purl.org/dc/terms/>
@@ -296,7 +296,7 @@ if [ -n "$SITE_UUID" ]; then
       { "op": "update", "data": { "type": "sites", "id": "'"$SITE_UUID"'",
         "relationships": { "contacts": { "data": [] } } } },
       { "op": "delete", "data": { "type": "contact-points", "id": "'"$CONTACT_UUID"'" } } ]')"
-  expect "organisation A clears the contacts of the site with an empty list and deletes the contact point" 201 '.data.attributes.status == "goedgekeurd"'
+  expect "organisation A clears the contacts of the site with an empty list and deletes the contact point" 201 '.data.attributes.status == "afgehandeld"'
   check_data "the site has no contact point left, and still its address; the contact point is gone" "
     PREFIX org: <http://www.w3.org/ns/org#> PREFIX mu: <http://mu.semte.ch/vocabularies/core/>
     PREFIX organisatie: <https://data.vlaanderen.be/ns/organisatie#>
@@ -306,7 +306,7 @@ if [ -n "$SITE_UUID" ]; then
   request POST "/change-requests" "$SESSION_ORG_A" "$(cr_body "$ORG_A_UUID" site '[
       { "op": "delete", "data": { "type": "sites", "id": "'"$SITE_UUID"'" } },
       { "op": "delete", "data": { "type": "addresses", "id": "'"$ADDRESS_UUID"'" } } ]')"
-  expect "organisation A deletes the site and its address" 201 '.data.attributes.status == "goedgekeurd"'
+  expect "organisation A deletes the site and its address" 201 '.data.attributes.status == "afgehandeld"'
   check_data "the deleted records are gone from the triplestore, the link from A included" "
     PREFIX mu: <http://mu.semte.ch/vocabularies/core/> PREFIX org: <http://www.w3.org/ns/org#>
     ASK { { VALUES ?uuid { \"$SITE_UUID\" \"$ADDRESS_UUID\" \"$CONTACT_UUID\" } ?s mu:uuid ?uuid . }
@@ -321,7 +321,7 @@ fi
 request GET "/administrative-units/$ORG_B_UUID/sites" "$SESSION_ORG_B"
 SITES_OF_B=$(echo "$BODY" | jq -c '[.data[]? | { type: "sites", id: .id }]' 2>/dev/null || echo '[]')
 request POST "/change-requests" "$SESSION_ABB" "$(create_site_body "$ORG_B_UUID" "$SITES_OF_B")"
-expect "ABB creates a site with an address and a contact point under organisation B" 201 '.data.attributes.status == "goedgekeurd" and .data.relationships["requesting-organisation"].data.id != "'"$ORG_B_UUID"'"'
+expect "ABB creates a site with an address and a contact point under organisation B" 201 '.data.attributes.status == "afgehandeld" and .data.relationships["requesting-organisation"].data.id != "'"$ORG_B_UUID"'"'
 ABB_SITE_UUID=$(echo "$BODY" | jq -r '.data.attributes.lids.s1 // empty')
 ABB_ADDRESS_UUID=$(echo "$BODY" | jq -r '.data.attributes.lids.a1 // empty')
 ABB_CONTACT_UUID=$(echo "$BODY" | jq -r '.data.attributes.lids.c1 // empty')
@@ -337,7 +337,7 @@ if [ -n "$ABB_SITE_UUID" ]; then
       { "op": "delete", "data": { "type": "sites", "id": "'"$ABB_SITE_UUID"'" } },
       { "op": "delete", "data": { "type": "addresses", "id": "'"$ABB_ADDRESS_UUID"'" } },
       { "op": "delete", "data": { "type": "contact-points", "id": "'"$ABB_CONTACT_UUID"'" } } ]')"
-  expect "ABB deletes them again" 201 '.data.attributes.status == "goedgekeurd"'
+  expect "ABB deletes them again" 201 '.data.attributes.status == "afgehandeld"'
   check_data "the records ABB created under B are gone" "
     PREFIX mu: <http://mu.semte.ch/vocabularies/core/>
     ASK { VALUES ?uuid { \"$ABB_SITE_UUID\" \"$ABB_ADDRESS_UUID\" \"$ABB_CONTACT_UUID\" } ?s mu:uuid ?uuid . }" false
