@@ -48,8 +48,13 @@ test('a datetime is normalised to UTC, as the template helper does', () => {
   assert.equal(term(attributeObjects('datetime', '2026-01-01T01:00:00+01:00')[0]), '"2026-01-01T00:00:00.000Z"^^xsd:dateTime');
 });
 
-test('url and uri-set values must be absolute IRIs without forbidden characters', () => {
+test('url and uri-set values must be absolute web addresses without forbidden characters', () => {
   const bad = [
+    'javascript:alert(1)',
+    'file:///etc/passwd',
+    'urn:uuid:4b6e8d0f-2a4c-4e6f-8a0b-2c4d6e8f0a1b',
+    'mailto:info@aalst.be',
+    'https://x/a\u0000b',
     'https://x/a> . } } ; DROP ALL #',
     'https://x/a b',
     'not a uri at all',
@@ -66,8 +71,29 @@ test('url and uri-set values must be absolute IRIs without forbidden characters'
     assert.throws(() => attributeObjects('uri-set', [value]), LiteralError, value);
   }
   assert.deepEqual(attributeObjects('url', 'https://data.vlaanderen.be/id/adres/123456?x=1&y=2#frag'), ['<https://data.vlaanderen.be/id/adres/123456?x=1&y=2#frag>']);
-  assert.deepEqual(attributeObjects('url', 'urn:uuid:4b6e8d0f-2a4c-4e6f-8a0b-2c4d6e8f0a1b'), ['<urn:uuid:4b6e8d0f-2a4c-4e6f-8a0b-2c4d6e8f0a1b>']);
-  assert.deepEqual(attributeObjects('url', 'mailto:info@aalst.be'), ['<mailto:info@aalst.be>']);
+  assert.deepEqual(attributeObjects('uri-set', ['http://aalst.be/besluiten/1']), ['<http://aalst.be/besluiten/1>']);
+});
+
+test('texts cannot hold control characters; tab, line feed and carriage return are fine', () => {
+  for (const value of ['a\u0000b', 'a\u0007b', 'a\u001bb', 'a\u007fb']) {
+    assert.throws(() => attributeObjects('string', value), LiteralError, JSON.stringify(value));
+    assert.throws(() => attributeObjects('string-set', [value]), LiteralError, JSON.stringify(value));
+    assert.throws(() => attributeObjects('language-string', { content: value, language: 'nl' }), LiteralError, JSON.stringify(value));
+  }
+  assert.equal(attributeObjects('string', 'regel 1\n\tregel 2\r\n').length, 1);
+});
+
+test('a date is a day of the calendar written YYYY-MM-DD, with a year from 1000 to 9999; a date-time carries its time zone', () => {
+  for (const value of ['2026-02-30', '2026-13-01', '2026-00-10', '2026-10-21Z', '2026-10-21+02:00', '2026-10-21T10:00:00Z', '21/10/2026', '0999-01-01', '10000-01-01', '+012026-01-01']) {
+    assert.throws(() => attributeObjects('date', value), LiteralError, value);
+  }
+  assert.deepEqual(attributeObjects('date', '2024-02-29'), ['"2024-02-29"^^xsd:date']);
+  for (const value of ['2026-10-21', '2026-10-21T10:00:00', '2026-02-30T10:00:00Z', '99999-01-01T00:00:00Z']) {
+    assert.throws(() => attributeObjects('datetime', value), LiteralError, value);
+  }
+  assert.equal(attributeObjects('datetime', '2026-10-21T10:00:00.000+02:00').length, 1);
+  assert.throws(() => attributeObjects('g-year', '99999'), LiteralError);
+  assert.equal(attributeObjects('g-year', '2026').length, 1);
 });
 
 test('refuses values that do not fit the type', () => {
