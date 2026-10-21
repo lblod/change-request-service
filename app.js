@@ -27,6 +27,21 @@ console.log(
     `scope ${process.env.DEFAULT_MU_AUTH_SCOPE || '(none: set DEFAULT_MU_AUTH_SCOPE)'}; body limit ${bodyLimit}`,
 );
 
+// An id (a uuid) never holds control characters; one that does would only reach the triplestore
+// to fail there after a long wait.
+const isId = (value) => typeof value === 'string' && value.length > 0 && value.length <= 200 && !/[\u0000-\u001f\u007f]/.test(value);
+
+app.param('id', (req, _res, next, id) => {
+  next(isId(id) ? undefined : new HttpError(404, 'Change request not found', { detail: 'No change request has this id' }));
+});
+
+// The bodies of the POST routes are JSON (application/json, or application/vnd.api+json, which
+// the template parses); anything else is refused before it is read.
+const acceptsJson = (req, _res, next) => {
+  if (req.is('application/json') || req.is('application/vnd.api+json')) return next();
+  next(new HttpError(415, 'Unsupported media type', { detail: 'Send the body as application/json or application/vnd.api+json' }));
+};
+
 // Before /change-requests/:id, or "permissions" would be taken for an id. With ?target= the
 // rights on that organisation; without, the rights of the session itself (which organisations
 // it may request, whether it decides).
@@ -34,7 +49,7 @@ app.get('/change-requests/permissions', async (req, res, next) => {
   try {
     const session = await requireSession(db, req);
     const target = req.query.target;
-    if (target !== undefined && (typeof target !== 'string' || !target)) {
+    if (target !== undefined && !isId(target)) {
       throw new HttpError(400, 'Invalid target', { detail: 'Pass the uuid of the organisation as ?target=, or leave it out' });
     }
     res.status(200).json(await service.permissions(session, target));
@@ -64,7 +79,7 @@ app.get('/change-requests/:id', async (req, res, next) => {
   }
 });
 
-app.post('/change-requests', bodyParser.json({ type: 'application/json', limit: bodyLimit }), async (req, res, next) => {
+app.post('/change-requests', acceptsJson, bodyParser.json({ type: 'application/json', limit: bodyLimit }), async (req, res, next) => {
   try {
     const session = await requireSession(db, req);
     const { status, document } = await service.create(session, req.body);
@@ -76,7 +91,7 @@ app.post('/change-requests', bodyParser.json({ type: 'application/json', limit: 
 
 // A step on an existing request: goedkeuring, afkeuring, informatievraag, informatieantwoord,
 // betwisting, intrekking or hertoepassing.
-app.post('/change-requests/:id/steps', bodyParser.json({ type: 'application/json', limit: bodyLimit }), async (req, res, next) => {
+app.post('/change-requests/:id/steps', acceptsJson, bodyParser.json({ type: 'application/json', limit: bodyLimit }), async (req, res, next) => {
   try {
     const session = await requireSession(db, req);
     const { status, document } = await service.addStep(session, req.params.id, req.body);
