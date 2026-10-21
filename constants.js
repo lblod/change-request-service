@@ -65,6 +65,10 @@ export const STEP_TYPE_KEYS = Object.keys(STEP_TYPE).filter((key) => !RESERVED_S
 // that exists, a request to register a new organisation (creation) and a request to register a
 // veranderingsgebeurtenis (change-event). Edits are applied at once; the other two wait for ABB.
 export const KINDS = ['edit', 'creation', 'change-event'];
+// The kinds GET /change-requests lists when filter[kind] does not name any: the requests that go
+// through validation. Edits apply at once and are kept as the history of the data only, so the
+// overviews leave them out; filter[kind]=edit lists them.
+export const LISTED_KINDS = ['creation', 'change-event'];
 
 const keysByUri = (concepts) => new Map(Object.entries(concepts).map(([key, uri]) => [uri, key]));
 const STATUS_KEY_BY_URI = keysByUri(STATUS);

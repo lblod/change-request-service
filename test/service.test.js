@@ -504,6 +504,15 @@ test('the same stale form changing only another attribute applies that one and l
   assert.ok(!apply.includes(prefLabel), 'the name is neither deleted nor written');
 });
 
+test('an edit whose operations change nothing is not stored: the history keeps changes only', async () => {
+  const db = fakeDb();
+  const { status, document, meta } = await service(db).create(sessions.orgA, rename('Aalst'));
+  assert.equal(status, 200);
+  assert.equal(document, null);
+  assert.deepEqual(meta, { unchanged: true });
+  assert.equal(db.updates.length, 0, 'nothing written');
+});
+
 test('competing requests: other pending requests that write the same key with another value are listed, on the conflict and as competing', async () => {
   const db = fakeDb({
     master: withName('Aalst (ABB)'),
@@ -563,10 +572,9 @@ test('a base may refer to a record deleted since: it is found through its versio
       },
     },
   ];
-  const { document } = await service(db).create(sessions.orgA, body(IDS.org, 'organization-core-data', ops));
-  assert.equal(document.attributes.status, 'afgehandeld');
+  const { status, meta } = await service(db).create(sessions.orgA, body(IDS.org, 'organization-core-data', ops));
   assert.ok(db.queries.some((q) => q.includes('SELECT DISTINCT ?uuid ?uri') && q.includes(gone)));
-  assert.ok(!db.updates[0].includes('cr:ProposedVersion'), 'the master already holds the proposal: agreement, nothing to write');
+  assert.deepEqual([status, meta, db.updates.length], [200, { unchanged: true }, 0], 'the master already holds the proposal: agreement, nothing to write');
 });
 
 // --- reading requests -------------------------------------------------------------------------
@@ -654,6 +662,19 @@ const storedRename = (n, proposed = 'Aalst (A)', base = 'Aalst') => storedVersio
 // An edit ABB made of organisation A, applied at once: history, listed only when edits are asked for.
 const abbRequest = requestRow(1, 'afgehandeld', { aggregate: 'organization-core-data', requestingOrganisation: URIS.abb, requestingOrganisationUuid: IDS.abb, creator: URIS.personAbb });
 const abbSteps = { agent: URIS.personAbb, agentUuid: sessions.abb.personUuid, organisation: URIS.abb, organisationUuid: IDS.abb, rule: 'abb-edits-all' };
+
+test('the list leaves the edits out unless they are asked for: they are the history of the data, not requests anyone acts on', async () => {
+  const db = fakeDb({ requests: [abbRequest, requestRow(2, 'ingediend')], steps: [...appliedTrail(1, abbSteps), stepRow(2, 1, 'indiening', 'ingediend')] });
+  const listed = await service(db).list(sessions.orgA, { target: IDS.org });
+  assert.deepEqual([listed.count, listed.documents.map((document) => [document.id, document.attributes.kind])], [1, [[RID(2), 'change-event']]]);
+  assert.ok(db.queries.find((q) => q.includes('SELECT (COUNT(DISTINCT ?request) AS ?count)')).includes('VALUES ?aggregate { """new-organisation""" """change-event""" }'), 'the count too');
+  const edits = await service(db).list(sessions.orgA, { target: IDS.org, kinds: ['edit'] });
+  assert.deepEqual([edits.count, edits.documents.map((document) => document.id)], [1, [RID(1)]]);
+  const both = await service(db).list(sessions.orgA, { target: IDS.org, kinds: ['edit', 'change-event'] });
+  assert.equal(both.count, 2);
+  // the detail of an edit stays readable: it is the history
+  assert.equal((await service(db).get(sessions.orgA, RID(1))).attributes.kind, 'edit');
+});
 
 test('a listed request shows its status, steps and organisations; the person who submitted it only to its organisation and ABB', async () => {
   const db = fakeDb({ requests: [abbRequest], steps: appliedTrail(1, abbSteps) });
@@ -1524,6 +1545,7 @@ test('the listing filters on the kind, the person (mine), the requester, the cla
   assert.deepEqual(await ids({ requester: 'ffffffff-ffff-4fff-8fff-ffffffffffff' }), [], 'an unknown requester');
   assert.deepEqual(await ids({ created: { from: '2026-10-01T00:00:00.000Z', until: '2026-10-31T00:00:00.000Z' } }), [RID(2)]);
   assert.deepEqual(await ids({ targetClassification: IDS.ilvCode, kinds: ['edit', 'creation'] }), [RID(2), RID(1)], 'oldest first; the fake does not join classifications, the query does');
+  assert.deepEqual(await ids({ targetClassification: IDS.ilvCode }), [RID(2)], 'without a kind: no edits');
   assert.ok(db.queries.some((q) => q.includes(`FILTER(?classification = <${URIS.ilvCode}>)`)));
   assert.deepEqual(await ids({ targetClassification: 'ffffffff-ffff-4fff-8fff-ffffffffffff' }), [], 'an unknown classification');
 });
@@ -1584,7 +1606,7 @@ test('an edit that changes the KBO number is checked like a creation; one that c
   const kboEdit = (localId) => body(IDS.org, 'organization-core-data', [{ op: 'update', data: { type: 'structured-identifiers', id: IDS.structuredKbo, attributes: { 'local-id': localId } } }]);
   // the number the organisation has, carried as it is: no lookup, even if another record held it
   const own = fakeDb({ holders: { '0207437468': { uri: URIS.orgB, uuid: IDS.orgB } } });
-  assert.equal((await service(own).create(sessions.orgA, kboEdit('0207.437.468'))).status, 201, 'normalised, it is what the organisation holds: nothing to check');
+  assert.equal((await service(own).create(sessions.orgA, kboEdit('0207.437.468'))).status, 200, 'normalised, it is what the organisation holds: nothing to change');
   assert.ok(!own.queries.some((q) => q.includes('VALUES ?localId')), 'no uniqueness lookup for a number the request does not write');
   // a new number someone else holds
   const taken = fakeDb({ holders: { '0123456789': { uri: URIS.orgB, uuid: IDS.orgB } } });
@@ -1705,6 +1727,24 @@ test('ABB\'s own change event from a stale form waits for ABB\'s goedkeuring wit
   // without a conflict ABB's change event is applied at once
   const fresh = fakeDb();
   assert.equal((await service(fresh).create(sessions.abb, body(IDS.org, 'change-event', changeEventOperations('Aalst (ABB)')))).document.attributes.status, 'afgehandeld');
+});
+
+test('an edit takes no validation steps: after a failed apply only a hertoepassing or an intrekking', async () => {
+  const failedEdit = (options = {}) => failedDb(options);
+  for (const db of [failedEdit()]) db.state.requests[0].aggregate = 'organization-core-data';
+  for (const stepType of ['goedkeuring', 'afkeuring', 'informatievraag']) {
+    const db = failedEdit();
+    db.state.requests[0].aggregate = 'organization-core-data';
+    await assert.rejects(() => service(db).addStep(sessions.abb, RID(2), step(stepType, { reason: 'x' })), (error) => {
+      assert.equal(error.status, 409);
+      assert.match(error.detail, /is an edit, which is applied at once; after a failed apply it takes only a hertoepassing or an intrekking/);
+      assert.equal(error.meta.kind, 'edit');
+      return true;
+    });
+  }
+  const withdrawn = failedEdit();
+  withdrawn.state.requests[0].aggregate = 'organization-core-data';
+  assert.equal((await service(withdrawn).addStep(sessions.orgA, RID(2), step('intrekking'))).document.attributes.status, 'ingetrokken');
 });
 
 test('a step that leaves a request waiting answers with its live conflicts and token, as a GET does', async () => {

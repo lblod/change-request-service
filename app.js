@@ -79,11 +79,13 @@ app.get('/change-requests/:id', async (req, res, next) => {
   }
 });
 
+// A new request; an edit that changes nothing is not stored and answers 200 with
+// { data: null, meta: { unchanged: true } }.
 app.post('/change-requests', acceptsJson, bodyParser.json({ type: 'application/json', limit: bodyLimit }), async (req, res, next) => {
   try {
     const session = await requireSession(db, req);
-    const { status, document } = await service.create(session, req.body);
-    res.status(status).json({ data: document });
+    const { status, document, meta } = await service.create(session, req.body);
+    res.status(status).json(meta ? { data: document, meta } : { data: document });
   } catch (error) {
     next(error);
   }
