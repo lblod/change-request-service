@@ -1,6 +1,6 @@
 {
   "name": "change-request-service",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Edits organisation data through change requests: builds RDF version objects from JSON:API operations, checks who may edit what, and applies approved requests in one SPARQL update inside the service scope.",
   "type": "module",
   "main": "app.js",

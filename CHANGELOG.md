@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - The validation flow of the designs (review of 19 October 2026): aggregates have a `kind` (`edit`, `creation`, `change-event`); an edit is applied at once (a conflict refuses it with 409 and its conflicts, nothing is held), a request to register a new organisation (`new-organisation`: the organisation is minted as the target, exists in the request only until approval, needs a KBO number the register and the pending creations do not hold, and is allowed per `creatableClassifications`, the "Wie beheert" table) or a veranderingsgebeurtenis (`change-event`, including the organisation's resulting fields) waits for ABB; what ABB requests itself is applied at once. `holdOnConflict` is gone. `new-organisation` operates on `change-event-results` too: the oprichting carries its result (the status the organisation starts with), which is what the organisation's veranderingsgebeurtenissen page lists.
 - Statuses `informatie-gevraagd` and `afgehandeld`, steps `informatievraag` (ABB, with a question), `informatieantwoord` (the requester), `betwisting` (the requester contests a rejection: `afgekeurd` is no longer final) and `afhandeling` (the service applies an approved request: `goedgekeurd` is the decision, `afgehandeld` the applied state; an apply records both in one update, a failed apply leaves the afhandeling `mislukt`); `POST /change-requests` takes an optional `reason`, kept on the indiening.
