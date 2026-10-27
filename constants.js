@@ -23,30 +23,52 @@ export const LINK_BASE = 'http://data.lblod.info/id/record-links/';
 // oslc:Error: why an apply failed, in the shape job-controller and delta-consumer write theirs.
 export const ERROR_BASE = 'http://redpencil.data.gift/id/jobs/error/';
 
-// The two code lists (published as SKOS by app-lokale-verkenner's migrations): the status of a request, and the
-// type of its steps. "wijziging" (an edit of a pending request) is reserved: it has a concept but
-// the service does not take it yet.
+// The two code lists (published as SKOS by app-lokale-verkenner's migrations): the status of a
+// request, and the type of its steps. The statuses follow the validation flow of the designs:
+// ingediend (the request is being validated), informatie-gevraagd (ABB asked the requester for
+// more information), afgekeurd, goedgekeurd (ABB or the service approved it, it is being
+// applied), afgehandeld (applied: the register holds it), ingetrokken and mislukt (the apply
+// failed). "wijziging" (an edit of a pending request) is reserved: it has a concept but the
+// service does not take it; a pending request is answered, contested or withdrawn, never amended.
 export const STATUS_SCHEME = 'http://lblod.data.gift/concept-schemes/e8274055-0834-4511-8b84-a2af41055633';
 export const STATUS = {
   ingediend: 'http://lblod.data.gift/concepts/d57aff85-43ce-4bd0-b962-6bd1b1fbc4b6',
+  'informatie-gevraagd': 'http://lblod.data.gift/concepts/f628da38-1583-4bfc-b3f3-eb41a7708944',
   goedgekeurd: 'http://lblod.data.gift/concepts/ca080d1f-f71c-4fe6-a4ed-a13fe1112989',
+  afgehandeld: 'http://lblod.data.gift/concepts/362d4aee-2fe3-45b3-a7ef-8602b8516bf0',
   afgekeurd: 'http://lblod.data.gift/concepts/b53c0c43-aa7c-4eb4-b113-81a370c21014',
   ingetrokken: 'http://lblod.data.gift/concepts/3dd55ff1-c322-4660-819d-4641de440544',
   mislukt: 'http://lblod.data.gift/concepts/b610e2dc-902c-4874-b65e-78b7f6411c05',
 };
 export const STATUS_KEYS = Object.keys(STATUS);
+// A request that still waits for a decision: its conflicts are checked live, it competes with
+// other requests and a newer request of the same organisation can replace it.
+export const PENDING_STATUS_KEYS = ['ingediend', 'informatie-gevraagd'];
 
 export const STEP_TYPE_SCHEME = 'http://lblod.data.gift/concept-schemes/65c4cf4a-f29f-45c9-aa71-498969638e42';
 export const STEP_TYPE = {
   indiening: 'http://lblod.data.gift/concepts/9ea4e33a-1745-4159-9a24-5706bad7ab38',
+  informatievraag: 'http://lblod.data.gift/concepts/f2665331-48f1-4830-a7c7-0d5a692b7b3d',
+  informatieantwoord: 'http://lblod.data.gift/concepts/886d2ed1-34c0-4642-b0f2-cd1e1960738e',
   goedkeuring: 'http://lblod.data.gift/concepts/bb2bb632-fc9f-41c6-a1eb-8f50e4008551',
+  afhandeling: 'http://lblod.data.gift/concepts/7f55ec41-b1fe-4145-acf1-15cb2cb13cd2',
   afkeuring: 'http://lblod.data.gift/concepts/765d7fc7-b078-4273-84c1-a7a84b61498e',
+  betwisting: 'http://lblod.data.gift/concepts/61e0e81d-bb69-422a-86c9-faa0df69514c',
   intrekking: 'http://lblod.data.gift/concepts/850f35c4-4333-4e6f-ab5a-ea3a2355cc5b',
   hertoepassing: 'http://lblod.data.gift/concepts/942ed957-87e0-477e-9afe-1bc0aedd6771',
   wijziging: 'http://lblod.data.gift/concepts/814430cf-ccb2-40b9-a057-d8a9cbc6bfdb',
 };
 export const RESERVED_STEP_TYPE_KEYS = ['wijziging'];
 export const STEP_TYPE_KEYS = Object.keys(STEP_TYPE).filter((key) => !RESERVED_STEP_TYPE_KEYS.includes(key));
+
+// The kinds of aggregate (config/change-requests.json): an edit of records of an organisation
+// that exists, a request to register a new organisation (creation) and a request to register a
+// veranderingsgebeurtenis (change-event). Edits are applied at once; the other two wait for ABB.
+export const KINDS = ['edit', 'creation', 'change-event'];
+// The kinds GET /change-requests lists when filter[kind] does not name any: the requests that go
+// through validation. Edits apply at once and are kept as the history of the data only, so the
+// overviews leave them out; filter[kind]=edit lists them.
+export const LISTED_KINDS = ['creation', 'change-event'];
 
 const keysByUri = (concepts) => new Map(Object.entries(concepts).map(([key, uri]) => [uri, key]));
 const STATUS_KEY_BY_URI = keysByUri(STATUS);
@@ -72,6 +94,7 @@ export const NS = {
   oslc: 'http://open-services.net/ns/core#',
   as: 'https://www.w3.org/ns/activitystreams#',
   org: 'http://www.w3.org/ns/org#',
+  skos: 'http://www.w3.org/2004/02/skos/core#',
   xsd: 'http://www.w3.org/2001/XMLSchema#',
 };
 
@@ -99,8 +122,18 @@ export const TARGET_TYPE = 'organizations';
 export const SPARQL_MAX_ROWS = Number.parseInt(process.env.SPARQL_MAX_ROWS, 10) || 10000;
 
 // GET /change-requests is paged: page[size] defaults to DEFAULT_PAGE_SIZE, at most MAX_PAGE_SIZE.
+// Virtuoso refuses an OFFSET past its row limit (SR353), so a page must end within it.
 export const DEFAULT_PAGE_SIZE = 20;
 export const MAX_PAGE_SIZE = 100;
+
+// The size of what one request may carry. The forms send a dozen operations and a handful of
+// values per key; the limits keep a single request from tying up the service and the triplestore
+// (a few hundred records overflow Virtuoso's stack on the apply, thousands of values per key take
+// seconds to merge), and are refused with a 422 that names them.
+export const MAX_OPERATIONS = 100;
+export const MAX_VALUES_PER_KEY = 100;
+// The longest text a step or a submission carries (a question, an answer, a reason).
+export const MAX_TEXT_LENGTH = 10000;
 
 export const PREFIXES = Object.entries(NS)
   .map(([prefix, uri]) => `PREFIX ${prefix}: <${uri}>`)

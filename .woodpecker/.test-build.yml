@@ -1,4 +1,17 @@
 steps:
+  # The unit tests, in the image the service runs on (Node 20, the template's dependencies and its
+  # `mu` helper), against the resources model of app-organization-portal's development branch: the
+  # tests assert on the types it shares with app-lokale-verkenner's.
+  test:
+    image: semtech/mu-javascript-template:1.9.1
+    environment:
+      npm_config_include: dev
+    commands:
+      - git clone --depth 1 --branch development https://github.com/lblod/app-organization-portal.git /tmp/app-organization-portal
+      - npm install --no-audit --no-fund
+      - rsync -a --ignore-existing /usr/src/app/node_modules/ node_modules/
+      - cp -R /usr/src/app/helpers/mu node_modules/mu
+      - MODEL_DIR=/tmp/app-organization-portal/config/resources npm test
   testbuild:
     image: woodpeckerci/plugin-docker-buildx
     settings:

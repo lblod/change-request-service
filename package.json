@@ -12,8 +12,11 @@
   "license": "MIT",
   "scripts": {
     "setup": "scripts/setup-ide.sh",
-    "test": "node --test 'test/*.test.js'",
+    "test": "node --test test/*.test.js",
     "check": "node --check app.js"
   },
-  "dependencies": {}
+  "dependencies": {},
+  "devDependencies": {
+    "sparqljs": "3.7.4"
+  }
 }

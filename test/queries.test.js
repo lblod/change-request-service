@@ -8,7 +8,9 @@ import {
   requestInsertQuery,
   applyQuery,
   stepQuery,
+  statusQueries,
   markFailedQuery,
+  cleanupStepQuery,
   changeRequestsQuery,
   requestPageQuery,
   requestCountQuery,
@@ -16,9 +18,18 @@ import {
   storedVersionsQuery,
   replacedStatesQuery,
   laterAppliedQuery,
-  competingQuery,
+  versionsChangingQuery,
+  requestsOfVersionsQuery,
+  proposedLocalIdsQuery,
+  proposedIdentifiersQuery,
+  identifierNamesQuery,
+  existingTriplesQuery,
+  leftoversQuery,
+  storedStepsQuery,
+  storedSubmissionQuery,
 } from '../lib/queries.js';
 import { STATUS, STEP_TYPE, OPERATION, SERVICE_AGENT } from '../constants.js';
+import { parses } from './support/sparql.js';
 
 const aggregate = config.aggregates['organization-core-data'];
 const graphs = { application: 'http://mu.semte.ch/application', changeRequests: 'http://mu.semte.ch/graphs/change-requests' };
@@ -43,12 +54,16 @@ const newStep = (fields) => {
   return { uri: `http://data.lblod.info/id/change-request-actions/${uuid}`, uuid, ...fields };
 };
 const submission = newStep({ type: 'indiening', status: 'ingediend', sequence: 1, at: NOW, agent: URIS.person, organisation: URIS.org, rule: 'own-organisation' });
-const approval = newStep({ type: 'goedkeuring', status: 'goedgekeurd', sequence: 2, at: APPLIED_AT, agent: SERVICE_AGENT, rule: 'always' });
+const approval = newStep({ type: 'goedkeuring', status: 'goedgekeurd', sequence: 2, at: APPLIED_AT, agent: SERVICE_AGENT, rule: 'edits-apply-at-once' });
+// the afhandeling that applies what the service approved
+const handling = newStep({ type: 'afhandeling', status: 'afgehandeld', sequence: 3, at: APPLIED_AT, agent: SERVICE_AGENT });
+const predicates = { name: `${NS.skos}prefLabel`, classification: `${NS.org}classification` };
 // what the masters held when the approval applied the request: the state of the fixtures
 const states = replacedStates({ versions, current: currentMap(), incoming: incomingMap(), model, mintUuid });
 
 /** Compares with the golden file; UPDATE_GOLDEN=1 rewrites it. */
 const golden = (name, actual) => {
+  parses(actual);
   const file = path.resolve('test/fixtures', name);
   if (process.env.UPDATE_GOLDEN) fs.writeFileSync(file, `${actual}\n`);
   assert.ok(fs.existsSync(file), `${file} is missing; run UPDATE_GOLDEN=1 npm test and review it`);
@@ -61,9 +76,9 @@ test('the uuids: the request, the minted master, one per built version, one per 
   assert.deepEqual(built.versions.map((version) => version.uuid), [3, 4, 5, 6, 7, 8].map(sequenceUuid));
   assert.deepEqual(versions.filter((version) => version.base).map((version) => version.base.uuid), [9, 10, 11, 12].map(sequenceUuid));
   assert.deepEqual(versions.at(-1).base.links.map((link) => link.uuid), [13].map(sequenceUuid), 'the tombstone: the site linked it');
-  assert.deepEqual([submission.uuid, approval.uuid], [14, 15].map(sequenceUuid));
-  assert.deepEqual(states.map((state) => state.uuid), [16, 17, 18, 19].map(sequenceUuid), 'no state before the create');
-  assert.deepEqual(states.at(-1).links.map((link) => link.uuid), [20].map(sequenceUuid));
+  assert.deepEqual([submission.uuid, approval.uuid, handling.uuid], [14, 15, 16].map(sequenceUuid));
+  assert.deepEqual(states.map((state) => state.uuid), [17, 18, 19, 20].map(sequenceUuid), 'no state before the create');
+  assert.deepEqual(states.at(-1).links.map((link) => link.uuid), [21].map(sequenceUuid));
 });
 
 test('the request insert writes the record, its indiening step, the versions and the states they started from in the change-requests graph', () => {
@@ -113,7 +128,7 @@ test('the request insert writes the record, its indiening step, the versions and
 });
 
 test('the apply replaces the single-valued keys, merges the set keys, inserts the versions, stamps the target and adds the step with the states it replaced', () => {
-  const query = applyQuery({ request, step: approval, versions, states, model, graphs });
+  const query = applyQuery({ request, step: handling, decision: approval, versions, states, model, graphs });
   assert.equal((query.match(/\bDELETE\b/g) || []).length, 1);
   assert.equal((query.match(/\bINSERT\b/g) || []).length, 1);
   assert.equal((query.match(/\bWHERE\b/g) || []).length, 1);
@@ -129,10 +144,12 @@ test('the apply replaces the single-valued keys, merges the set keys, inserts th
   assert.equal((addressGroup.match(/<http/g) || []).length, 1 + 3);
   for (const predicate of [`${NS.adres}Adresvoorstelling.huisnummer`, `${NS.locn}fullAddress`, `${NS.adres}verwijstNaar`]) assert.ok(addressGroup.includes(`<${predicate}>`), predicate);
   assert.ok(query.includes(`<${URIS.address}> <${NS.adres}Adresvoorstelling.huisnummer> """3""" ;\n      <${NS.locn}fullAddress> """Grote Markt 3, 9300 Aalst, België""" ;`));
-  // the organisation: the name and the cleared werkingsgebied are replaced; the sites (a set) lose the one it unlinks
+  // the organisation: the name is replaced (the werkingsgebied it carries as it is, read-only through the
+  // kerngegevens); the sites (a set) lose the one it unlinks
   const orgGroup = group(URIS.org);
-  assert.equal((orgGroup.match(/<http/g) || []).length, 1 + 2);
-  for (const predicate of [`${NS.skos}prefLabel`, `${NS.besluit}werkingsgebied`]) assert.ok(orgGroup.includes(`<${predicate}>`), predicate);
+  assert.equal((orgGroup.match(/<http/g) || []).length, 1 + 1);
+  assert.ok(orgGroup.includes(`<${NS.skos}prefLabel>`));
+  assert.ok(!query.includes(`<${NS.besluit}werkingsgebied> `), 'the werkingsgebied is not written');
   assert.ok(query.includes(`DELETE {\n  GRAPH <http://mu.semte.ch/application> {\n    ?s ?p ?o .\n    <${URIS.site}> <${NS.org}siteAddress> <${URIS.oldContact}> .\n    <${URIS.org}> <${NS.org}hasSite> <${URIS.site}> .\n  }`), 'the values a merge removes');
   assert.ok(!query.includes(`<${NS.org}classification>`), 'classification is never touched');
   // the site: its site type (a reference) is replaced, the new contact point added to its contacts
@@ -154,14 +171,22 @@ test('the apply replaces the single-valued keys, merges the set keys, inserts th
   // the stamp on the target with the person who submitted the request
   assert.ok(query.includes(`VALUES ?s { <${URIS.org}> }\n    VALUES ?p { dct:modified ext:lastModifiedBy }`));
   assert.ok(query.includes(`<${URIS.org}> dct:modified "2026-11-03T10:12:01.000Z"^^xsd:dateTime ;\n      ext:lastModifiedBy <${URIS.person}> .`));
-  // the step, the states it replaced and the status, in the same update
+  // the goedkeuring and the afhandeling with the states it replaced, in the same update; not the request's
+  // status, which follows once the apply is read back (statusQueries)
   assert.ok(query.includes(`INSERT {\n  GRAPH <http://mu.semte.ch/application> {`));
-  assert.ok(query.includes(`  GRAPH <http://mu.semte.ch/graphs/change-requests> {\n    <${request.uri}> adms:status <${STATUS.goedgekeurd}> .\n    <${approval.uri}> a cr:Action ;`));
+  assert.ok(query.includes(`  GRAPH <http://mu.semte.ch/graphs/change-requests> {\n    <${approval.uri}> a cr:Action ;`));
+  assert.ok(!query.includes(`<${request.uri}> adms:status`), 'the status is not touched');
   assert.ok(
     query.includes(
-      `<${approval.uri}> a cr:Action ;\n      mu:uuid """${approval.uuid}""" ;\n      dct:isPartOf <${request.uri}> ;\n      dct:type <${STEP_TYPE.goedkeuring}> ;\n      adms:status <${STATUS.goedgekeurd}> ;\n      schema:position "2"^^xsd:integer ;\n      prov:startedAtTime "2026-11-03T10:12:01.000Z"^^xsd:dateTime ;\n      prov:wasAssociatedWith <${SERVICE_AGENT}> ;\n      cr:rule """always""" ;\n      prov:invalidated ${states.map((state) => `<${state.uri}>`).join(', ')} .`,
+      `<${approval.uri}> a cr:Action ;\n      mu:uuid """${approval.uuid}""" ;\n      dct:isPartOf <${request.uri}> ;\n      dct:type <${STEP_TYPE.goedkeuring}> ;\n      adms:status <${STATUS.goedgekeurd}> ;\n      schema:position "2"^^xsd:integer ;\n      prov:startedAtTime "2026-11-03T10:12:01.000Z"^^xsd:dateTime ;\n      prov:wasAssociatedWith <${SERVICE_AGENT}> ;\n      cr:rule """edits-apply-at-once""" .`,
     ),
-    'the service took it: no acting organisation',
+    'the service approved it: no acting organisation, no states (the afhandeling replaces them)',
+  );
+  assert.ok(
+    query.includes(
+      `<${handling.uri}> a cr:Action ;\n      mu:uuid """${handling.uuid}""" ;\n      dct:isPartOf <${request.uri}> ;\n      dct:type <${STEP_TYPE.afhandeling}> ;\n      adms:status <${STATUS.afgehandeld}> ;\n      schema:position "3"^^xsd:integer ;\n      prov:startedAtTime "2026-11-03T10:12:01.000Z"^^xsd:dateTime ;\n      prov:wasAssociatedWith <${SERVICE_AGENT}> ;\n      prov:invalidated ${states.map((state) => `<${state.uri}>`).join(', ')} .`,
+    ),
+    'the afhandeling applied it and replaced the states',
   );
   const [addressState, siteState, orgState, contactState] = states;
   assert.ok(
@@ -171,22 +196,24 @@ test('the apply replaces the single-valued keys, merges the set keys, inserts th
     'what the address held for the keys the version changes',
   );
   assert.ok(query.includes(`<${siteState.uri}> a cr:RecordState ;\n      mu:uuid """${siteState.uuid}""" ;\n      dct:isVersionOf <${URIS.site}> ;\n      <${NS.org}siteAddress> <${URIS.oldContact}> .`), 'the whole set the merge changed; no site type');
-  assert.ok(query.includes(`<${orgState.uri}> a cr:RecordState ;\n      mu:uuid """${orgState.uuid}""" ;\n      dct:isVersionOf <${URIS.org}> ;\n      <${NS.besluit}werkingsgebied> <${URIS.location}> ;`));
+  assert.ok(query.includes(`<${orgState.uri}> a cr:RecordState ;\n      mu:uuid """${orgState.uuid}""" ;\n      dct:isVersionOf <${URIS.org}> ;\n      <${NS.skos}prefLabel> """Aalst""" ;\n      <${NS.org}hasSite> <${URIS.site}> .`));
   const [link] = contactState.links;
   assert.ok(query.includes(`<${contactState.uri}> a cr:RecordState ;\n      mu:uuid """${contactState.uuid}""" ;\n      dct:isVersionOf <${URIS.oldContact}> ;\n      cr:incomingLink <${link.uri}> .`), 'the deleted contact point and the site that linked it');
   assert.ok(query.includes(`<${link.uri}> a rdf:Statement ;\n      mu:uuid """${link.uuid}""" ;\n      rdf:subject <${URIS.site}> ;\n      rdf:predicate <${NS.org}siteAddress> ;\n      rdf:object <${URIS.oldContact}> .`));
-  assert.ok(query.includes(`  }\n  GRAPH <http://mu.semte.ch/graphs/change-requests> {\n    <${request.uri}> adms:status ?oldStatus .`));
+  assert.ok(!query.includes('?oldStatus'));
   // every WHERE group is independent; the first one, the request's type, always matches
   assert.ok(query.includes(`WHERE {\n  {\n    GRAPH <http://mu.semte.ch/graphs/change-requests> { <${request.uri}> a cr:ChangeRequest . }\n  }\n  UNION`));
-  const groups = 2 /* request type, request status */ + 3 /* updates */ + 2 /* tombstone */ + 1; /* target stamp */
+  const groups = 1 /* request type */ + 3 /* updates */ + 2 /* tombstone */ + 1; /* target stamp */
   assert.equal((query.match(/\n {2}UNION\n/g) || []).length, groups - 1);
   golden('apply.sparql', query);
 });
 
-test('a goedkeuring by ABB carries the person, the organisation and the rule; the stamp names the person who submitted the change', () => {
-  const decision = newStep({ type: 'goedkeuring', status: 'goedgekeurd', sequence: 2, at: APPLIED_AT, agent: URIS.personAbb, organisation: URIS.abb, rule: 'abb-decides-all', overriddenConflicts: [{ key: 'name' }] });
-  const query = applyQuery({ request, step: decision, versions, states, model, graphs });
-  assert.ok(query.includes(`prov:wasAssociatedWith <${URIS.personAbb}> ;\n      cr:actingOrganisation <${URIS.abb}> ;\n      cr:rule """abb-decides-all""" ;\n      prov:invalidated `));
+test('a goedkeuring by ABB carries the person, the organisation and the rule; the afhandeling that follows replaces the states; the stamp names the person who submitted the change', () => {
+  const decision = newStep({ type: 'goedkeuring', status: 'goedgekeurd', sequence: 2, at: APPLIED_AT, agent: URIS.personAbb, organisation: URIS.abb, rule: 'abb-decides-all', reason: 'In orde' });
+  const applying = newStep({ type: 'afhandeling', status: 'afgehandeld', sequence: 3, at: APPLIED_AT, agent: SERVICE_AGENT, overriddenConflicts: [{ key: 'name' }] });
+  const query = applyQuery({ request, step: applying, decision, versions, states, model, graphs });
+  assert.ok(query.includes(`prov:wasAssociatedWith <${URIS.personAbb}> ;\n      cr:actingOrganisation <${URIS.abb}> ;\n      cr:rule """abb-decides-all""" ;\n      dct:description """In orde""" .`));
+  assert.ok(query.includes(`prov:wasAssociatedWith <${SERVICE_AGENT}> ;\n      prov:invalidated `));
   assert.ok(!query.includes('overrid'), 'what it overrode is kept by the states it replaced, not written as such');
   assert.ok(query.includes(`ext:lastModifiedBy <${URIS.person}>`), 'not the approver');
 });
@@ -202,35 +229,60 @@ test('a plan removes given values and inserts given triples; without a plan a ve
   assert.ok(applyQuery({ request, step: approval, versions: [unplanned], model, graphs }).includes(`VALUES ?s { <${URIS.address}> }\n    VALUES ?p { ${address.replaces.map((p) => `<${p}>`).join(' ')} }`));
 });
 
-test('approving a request that changes nothing records the step and the status only', () => {
-  const query = applyQuery({ request, step: approval, versions: [], model, graphs });
+test('approving a request that changes nothing records the steps only, without a DELETE', () => {
+  const query = parses(applyQuery({ request, step: handling, decision: approval, versions: [], model, graphs }));
   assert.ok(!query.includes('http://mu.semte.ch/application'), 'no application graph, no stamp');
-  assert.ok(query.includes(`<${request.uri}> adms:status <${STATUS.goedgekeurd}> .\n    <${approval.uri}> a cr:Action ;`));
+  assert.ok(!query.includes('DELETE'), 'nothing to delete: no empty DELETE template');
+  assert.ok(query.includes(`GRAPH <http://mu.semte.ch/graphs/change-requests> {\n    <${approval.uri}> a cr:Action ;`));
+  assert.ok(query.includes(`<${handling.uri}> a cr:Action ;`));
   assert.ok(!query.includes('prov:invalidated'), 'it replaced nothing');
-  assert.equal((query.match(/\n {2}UNION\n/g) || []).length, 1);
+  assert.equal((query.match(/\n {2}UNION\n/g) || []).length, 0);
 });
 
-test('an afkeuring or intrekking changes the status and adds the step with its reason; the intrekking of a replaced request names the newer one', () => {
+test('a status is set in two updates: the new one is added before the others are removed, so a request never lacks one', () => {
+  const [add, removeOthers] = statusQueries({ request, status: 'afgekeurd', graph: graphs.changeRequests }).map(parses);
+  assert.ok(add.includes(`INSERT DATA {\n  GRAPH <${graphs.changeRequests}> { <${request.uri}> adms:status <${STATUS.afgekeurd}> . }\n}`));
+  assert.ok(!add.includes('DELETE'));
+  assert.ok(removeOthers.includes(`DELETE {\n  GRAPH <${graphs.changeRequests}> { <${request.uri}> adms:status ?other . }\n}`));
+  assert.ok(removeOthers.includes(`FILTER(?other != <${STATUS.afgekeurd}>)`), 'never the status just added');
+  assert.ok(!removeOthers.includes('INSERT'));
+});
+
+test('an informatievraag, an informatieantwoord and a betwisting change the status and keep their text', () => {
+  const question = newStep({ type: 'informatievraag', status: 'informatie-gevraagd', sequence: 2, at: APPLIED_AT, agent: URIS.personAbb, organisation: URIS.abb, rule: 'abb-decides-all', reason: 'Welk besluit?' });
+  const asked = parses(stepQuery({ request, step: question, graphs }));
+  assert.ok(asked.includes(`INSERT DATA {\n  GRAPH <${graphs.changeRequests}> {\n    <${question.uri}> a cr:Action ;`), 'the step only: the status follows with statusQueries');
+  assert.ok(!asked.includes(`<${request.uri}> adms:status`));
+  assert.ok(asked.includes(`dct:type <${STEP_TYPE.informatievraag}> ;\n      adms:status <${STATUS['informatie-gevraagd']}> ;`) && asked.includes('dct:description """Welk besluit?"""'));
+  const answer = newStep({ type: 'informatieantwoord', status: 'ingediend', sequence: 3, at: APPLIED_AT, agent: URIS.person, organisation: URIS.org, rule: 'requesting-organisation', reason: 'Zie link' });
+  assert.ok(stepQuery({ request, step: answer, graphs }).includes(`dct:type <${STEP_TYPE.informatieantwoord}> ;\n      adms:status <${STATUS.ingediend}> ;`));
+  const contest = newStep({ type: 'betwisting', status: 'ingediend', sequence: 4, at: APPLIED_AT, agent: URIS.person, organisation: URIS.org, rule: 'requesting-organisation', reason: 'Het besluit is wel geldig' });
+  assert.ok(stepQuery({ request, step: contest, graphs }).includes(`dct:type <${STEP_TYPE.betwisting}> ;\n      adms:status <${STATUS.ingediend}> ;`));
+});
+
+test('an afkeuring or intrekking adds the step with its reason; the intrekking of a replaced request names the newer one', () => {
   const rejection = newStep({ type: 'afkeuring', status: 'afgekeurd', sequence: 2, at: APPLIED_AT, agent: URIS.personAbb, organisation: URIS.abb, rule: 'abb-decides-all', reason: 'Het "ondernemingsnummer" klopt niet' });
-  const query = stepQuery({ request, step: rejection, graphs });
+  const query = parses(stepQuery({ request, step: rejection, graphs }));
   assert.ok(!query.includes('http://mu.semte.ch/application'));
-  assert.ok(query.includes(`DELETE {\n  GRAPH <${graphs.changeRequests}> {\n    <${request.uri}> adms:status ?oldStatus .\n  }\n}`));
-  assert.ok(query.includes(`<${request.uri}> adms:status <${STATUS.afgekeurd}> .\n    <${rejection.uri}> a cr:Action ;`));
+  assert.ok(!query.includes('DELETE'), 'nothing is deleted: the status follows with statusQueries');
+  assert.ok(query.includes(`GRAPH <${graphs.changeRequests}> {\n    <${rejection.uri}> a cr:Action ;`));
   assert.ok(query.includes(`dct:type <${STEP_TYPE.afkeuring}> ;\n      adms:status <${STATUS.afgekeurd}> ;\n      schema:position "2"^^xsd:integer ;`));
   assert.ok(query.includes('cr:rule """abb-decides-all""" ;\n      dct:description """Het \\"ondernemingsnummer\\" klopt niet""" .'));
   assert.ok(!query.includes('dct:isReplacedBy'));
   const newer = `http://data.lblod.info/id/change-requests/${testUuid('request', 9)}`;
   const withdrawal = newStep({ type: 'intrekking', status: 'ingetrokken', sequence: 2, at: APPLIED_AT, agent: SERVICE_AGENT, rule: 'superseded-by-own-request', reason: `Vervangen door wijzigingsaanvraag ${testUuid('request', 9)}` });
-  const replaced = stepQuery({ request, step: withdrawal, graphs, replacedBy: newer });
-  assert.ok(replaced.includes(`<${request.uri}> adms:status <${STATUS.ingetrokken}> ;\n      dct:isReplacedBy <${newer}> .`));
+  const replaced = parses(stepQuery({ request, step: withdrawal, graphs, replacedBy: newer }));
+  assert.ok(replaced.includes(`\n    <${request.uri}> dct:isReplacedBy <${newer}> .`));
 });
 
-test('a failed apply is recorded as a step with status mislukt, an oslc:Error and the states the attempt replaced; the request becomes mislukt', () => {
+test('a failed apply is recorded as a step with status mislukt, an oslc:Error and the states the attempt replaced; the status follows', () => {
   const error = { uri: `http://redpencil.data.gift/id/jobs/error/${testUuid('error', 1)}`, uuid: testUuid('error', 1), message: 'Virtuoso said "no"', at: APPLIED_AT };
-  const query = markFailedQuery({ request, step: { ...approval, error }, states, graph: graphs.changeRequests });
-  assert.ok(query.includes(`<${request.uri}> adms:status <${STATUS.mislukt}> .\n    <${approval.uri}> a cr:Action ;`));
-  assert.ok(query.includes(`dct:type <${STEP_TYPE.goedkeuring}> ;\n      adms:status <${STATUS.mislukt}> ;\n      schema:position "2"^^xsd:integer ;`));
-  assert.ok(query.includes(`cr:rule """always""" ;\n      task:error <${error.uri}> ;\n      prov:invalidated ${states.map((state) => `<${state.uri}>`).join(', ')} .`));
+  const query = parses(markFailedQuery({ request, step: { ...handling, error }, decision: approval, states, graph: graphs.changeRequests }));
+  assert.ok(query.includes(`INSERT DATA {\n  GRAPH <${graphs.changeRequests}> {\n    <${approval.uri}> a cr:Action ;`), 'the goedkeuring is kept; nothing is deleted');
+  assert.ok(!query.includes(`<${request.uri}> adms:status`) && !query.includes('DELETE'));
+  assert.ok(query.includes(`dct:type <${STEP_TYPE.goedkeuring}> ;\n      adms:status <${STATUS.goedgekeurd}> ;\n      schema:position "2"^^xsd:integer ;`));
+  assert.ok(query.includes(`dct:type <${STEP_TYPE.afhandeling}> ;\n      adms:status <${STATUS.mislukt}> ;\n      schema:position "3"^^xsd:integer ;`));
+  assert.ok(query.includes(`prov:wasAssociatedWith <${SERVICE_AGENT}> ;\n      task:error <${error.uri}> ;\n      prov:invalidated ${states.map((state) => `<${state.uri}>`).join(', ')} .`));
   assert.ok(
     query.includes(
       `<${error.uri}> a oslc:Error ;\n      mu:uuid """${error.uuid}""" ;\n      oslc:message """Virtuoso said \\"no\\"""" ;\n      dct:created "2026-11-03T10:12:01.000Z"^^xsd:dateTime ;\n      dct:creator <${SERVICE_AGENT}> ;\n      dct:references <${request.uri}> .`,
@@ -238,43 +290,60 @@ test('a failed apply is recorded as a step with status mislukt, an oslc:Error an
     'in the shape job-controller writes its errors',
   );
   assert.ok(query.includes(`<${states[0].uri}> a cr:RecordState ;`));
-  assert.ok(query.includes(`<${request.uri}> adms:status ?status .\n    <${approval.uri}> ?stepPredicate ?stepObject .`), 'what an interrupted attempt wrote of the step is replaced');
-  assert.ok(query.includes(`{ <${request.uri}> a cr:ChangeRequest . }`));
+  // what an interrupted attempt wrote of its step goes, by the step's URI
+  const cleanup = parses(cleanupStepQuery({ stepUri: handling.uri, graph: graphs.changeRequests }));
+  assert.ok(cleanup.includes(`DELETE {\n  GRAPH <${graphs.changeRequests}> { <${handling.uri}> ?p ?o . }\n}`) && !cleanup.includes('INSERT'));
 });
 
-test('the listing pages the requests that match the filters, newest first, and reads the details of a page by URI', () => {
-  const filters = { targetUri: URIS.org, visibleTo: URIS.orgB, statuses: ['ingediend', 'mislukt'] };
-  const page = requestPageQuery({ ...filters, limit: 20, offset: 40 });
+test('the listing pages the requests that match the filters, oldest first by default, and reads the details of a page by URI', () => {
+  const visibility = { organisation: URIS.orgB, statuses: ['afgehandeld'] };
+  const involved = `FILTER(?target = <${URIS.orgB}> || ?requestingOrganisation = <${URIS.orgB}> || ?status IN (<${STATUS.afgehandeld}>))`;
+  const filters = { targetUri: URIS.org, visibility, statuses: ['ingediend', 'mislukt'] };
+  const page = requestPageQuery({ ...filters, sort: '-created', limit: 20, offset: 40 });
   assert.ok(page.includes('SELECT DISTINCT ?request ?created'));
   assert.ok(page.includes('?request a cr:ChangeRequest ;'));
   assert.ok(page.includes('pav:createdBy ?requestingOrganisation ;\n    dct:creator ?creator .'));
+  assert.ok(!page.includes('?targetUuid'), 'the target is not joined: a creation that waits has none in the data');
   assert.ok(page.includes(`VALUES ?status { <${STATUS.ingediend}> <${STATUS.mislukt}> }`));
   assert.ok(page.includes(`FILTER(?target = <${URIS.org}>)`));
-  assert.ok(page.includes(`FILTER(?target = <${URIS.orgB}> || ?requestingOrganisation = <${URIS.orgB}>)`));
+  assert.ok(page.includes(involved), 'an organisation that is not ABB, while pending requests are for the involved only');
   assert.ok(page.endsWith('ORDER BY DESC(?created) DESC(?request)\nLIMIT 20\nOFFSET 40'));
+  assert.ok(requestPageQuery({ limit: 20, offset: 0 }).endsWith('ORDER BY ASC(?created) ASC(?request)\nLIMIT 20\nOFFSET 0'), 'oldest first by default');
   assert.throws(() => requestPageQuery({ ...filters, limit: '20; DROP', offset: 0 }), /expected a whole number/);
   const count = requestCountQuery(filters);
   assert.ok(count.includes('SELECT (COUNT(DISTINCT ?request) AS ?count)') && count.includes(`VALUES ?status { <${STATUS.ingediend}> <${STATUS.mislukt}> }`));
-  assert.ok(!requestPageQuery({ limit: 20, offset: 0 }).includes('FILTER'), 'ABB sees all');
+  assert.ok(!requestPageQuery({ limit: 20, offset: 0 }).includes('FILTER'), 'everyone sees all');
+  // the filters of the listing: the person who submitted them, the kind, the requester, the classification, the time
+  const filtered = requestPageQuery({ creatorUri: URIS.person, aggregates: ['new-organisation', 'change-event'], requesterUri: URIS.org, classification: { uri: URIS.ilvCode, predicate: predicates.classification }, createdFrom: '2026-10-01T00:00:00Z', createdUntil: '2026-10-31T23:59:59Z', limit: 20, offset: 0 });
+  assert.ok(filtered.includes(`FILTER(?creator = <${URIS.person}>)`));
+  assert.ok(filtered.includes('VALUES ?aggregate { """new-organisation""" """change-event""" }'));
+  assert.ok(filtered.includes(`FILTER(?requestingOrganisation = <${URIS.org}>)`));
+  assert.ok(filtered.includes(`{ ?target <${NS.org}classification> ?classification . }\n  UNION\n  {`) && filtered.includes(`FILTER(?classification = <${URIS.ilvCode}>)`), 'the classification of the organisation, or of the one a creation proposes');
+  assert.ok(filtered.includes('FILTER(?created >= "2026-10-01T00:00:00.000Z"^^xsd:dateTime)') && filtered.includes('FILTER(?created <= "2026-10-31T23:59:59.000Z"^^xsd:dateTime)'));
 
   const other = `http://data.lblod.info/id/change-requests/${testUuid('request', 2)}`;
-  const details = changeRequestsQuery({ requestUris: [request.uri, other] });
+  const details = changeRequestsQuery({ requestUris: [request.uri, other], predicates });
   assert.ok(details.includes(`VALUES ?request { <${request.uri}> <${other}> }`));
   assert.ok(details.includes('OPTIONAL {\n    ?request dct:isReplacedBy ?replacedBy .\n    ?replacedBy mu:uuid ?replacedByUuid .\n  }'), 'the newer request that replaced it');
+  assert.ok(details.includes('OPTIONAL { ?target mu:uuid ?targetUuid . }') && details.includes(`OPTIONAL { ?target <${NS.skos}prefLabel> ?targetName . }`), 'the target when it exists');
+  assert.ok(details.includes(`dct:type <${STEP_TYPE.indiening}> ;\n      prov:generated ?targetVersion .\n    ?targetVersion dct:isVersionOf ?target ;\n      cr:masterUuid ?proposedUuid .`), 'else what the submission proposes');
   assert.ok(!details.includes('cr:appliedAt'));
-  const one = changeRequestsQuery({ uuid: requestUuid, visibleTo: URIS.orgB });
-  assert.ok(one.includes(`?request mu:uuid """${requestUuid}""" .`) && one.includes(`FILTER(?target = <${URIS.orgB}> || ?requestingOrganisation = <${URIS.orgB}>)`));
+  const one = changeRequestsQuery({ uuid: requestUuid, visibility, predicates });
+  assert.ok(one.includes(`?request mu:uuid """${requestUuid}""" .`) && one.includes(involved));
 
   const steps = stepsQuery({ requestUris: [request.uri] });
   assert.ok(steps.includes(`VALUES ?request { <${request.uri}> }`));
-  assert.ok(steps.includes('?step a cr:Action ;\n    dct:isPartOf ?request ;\n    mu:uuid ?stepUuid ;\n    schema:position ?sequence ;'));
+  assert.ok(steps.includes('?step dct:isPartOf ?request ;\n    a cr:Action ;\n    mu:uuid ?stepUuid ;\n    schema:position ?sequence ;'));
   assert.ok(steps.includes('OPTIONAL { ?agent mu:uuid ?agentUuid . }'));
   assert.ok(steps.includes('?step task:error ?errorRecord .\n    ?errorRecord oslc:message ?error .'));
-  const visible = stepsQuery({ uuid: requestUuid, visibleTo: URIS.orgB });
-  assert.ok(visible.includes(`?request mu:uuid """${requestUuid}""" .`) && visible.includes(`FILTER(?target = <${URIS.orgB}> || ?requestingOrganisation = <${URIS.orgB}>)`));
+  assert.ok(!steps.includes('FILTER'), 'by URI only: who may see the request is decided before');
+  assert.ok(steps.indexOf('VALUES ?request') < steps.indexOf('?step dct:isPartOf ?request'), 'anchored on the requests');
+  for (const query of [page, count, filtered, details, one, steps]) parses(query);
+  assert.ok(details.includes('OPTIONAL { ?request adms:status ?status . }'), 'a request whose status was lost is still found');
+  assert.ok(details.includes('OPTIONAL { ?requestingOrganisation mu:uuid ?requestingOrganisationUuid . }'), 'and one whose requesting organisation is gone');
 });
 
-test('the stored versions, replaced states, later-applied and competing queries', () => {
+test('the stored versions, replaced states, later-applied queries and the anchored lookups of other requests', () => {
   const other = `http://data.lblod.info/id/change-requests/${testUuid('request', 2)}`;
   const stored = storedVersionsQuery({ requestUris: [request.uri, other] });
   assert.ok(stored.includes(`VALUES ?request { <${request.uri}> <${other}> }`));
@@ -288,22 +357,48 @@ test('the stored versions, replaced states, later-applied and competing queries'
 
   const later = laterAppliedQuery({ targetUri: URIS.org, after: '2026-11-03T10:12:00Z', exclude: request.uri });
   assert.ok(later.includes(`cr:target <${URIS.org}> .`));
-  assert.ok(later.includes(`?step a cr:Action ;\n    dct:isPartOf ?request ;\n    adms:status <${STATUS.goedgekeurd}> ;\n    prov:startedAtTime ?appliedAt .`));
+  assert.ok(later.includes(`?step a cr:Action ;\n    dct:isPartOf ?request ;\n    adms:status <${STATUS.afgehandeld}> ;\n    prov:startedAtTime ?appliedAt .`));
   assert.ok(later.includes('?submission a cr:Action ;\n    dct:isPartOf ?request ;\n    prov:generated ?version .'), 'only a request that changed something: an approval of a request without versions does not count');
   assert.ok(later.includes(`FILTER(?request != <${request.uri}>)`));
   assert.ok(later.includes('FILTER(?appliedAt > "2026-11-03T10:12:00.000Z"^^xsd:dateTime)'));
   assert.ok(later.includes('LIMIT 1'));
 
-  const competing = competingQuery({ pairs: [{ subject: URIS.org, predicate: `${NS.skos}prefLabel` }] });
-  assert.ok(competing.includes('SELECT DISTINCT ?request ?uuid\n'));
-  assert.ok(competing.includes(`VALUES (?master ?p) { (<${URIS.org}> <${NS.skos}prefLabel>) }`));
-  assert.ok(competing.includes(`adms:status <${STATUS.ingediend}> .`));
-  assert.ok(competing.includes('?version dct:isVersionOf ?master ;\n    cr:changesProperty ?p .\n}'));
+  // The lookups of other requests: small queries, each starting from the values it is given, so Virtuoso
+  // does not refuse them on its cost estimate while the change-requests graph is still empty.
+  const changing = parses(versionsChangingQuery({ pairs: [{ subject: URIS.org, predicate: `${NS.skos}prefLabel` }] }));
+  assert.ok(changing.includes(`VALUES (?master ?p) { (<${URIS.org}> <${NS.skos}prefLabel>) }\n  ?version dct:isVersionOf ?master ;\n    cr:changesProperty ?p .\n}`));
+  const version = `http://data.lblod.info/id/proposed-versions/${testUuid('version', 1)}`;
+  const ofVersions = parses(requestsOfVersionsQuery({ versionUris: [version] }));
+  assert.ok(ofVersions.includes(`VALUES ?version { <${version}> }\n  ?submission prov:generated ?version ;\n    dct:isPartOf ?request .`));
+  assert.ok(ofVersions.includes('adms:status ?status ;\n    cr:aggregate ?aggregate ;\n    pav:createdBy ?requestingOrganisation .'), 'the status and the aggregate are filtered by the service');
+
+  const identifierPredicates = { identifiers: `${NS.adms}identifier`, idName: `${NS.skos}notation`, structuredIdentifier: `${NS.generiek}gestructureerdeIdentificator`, localId: `${NS.generiek}lokaleIdentificator` };
+  const localIds = parses(proposedLocalIdsQuery({ localIds: ['0123456789', '0123.456.789'], predicates: identifierPredicates }));
+  assert.ok(localIds.includes(`VALUES ?localId { """0123456789""" """0123.456.789""" }\n  ?structuredVersion <${NS.generiek}lokaleIdentificator> ?localId ;\n    dct:isVersionOf ?structured ;\n    a cr:ProposedVersion .`));
+  const structured = `http://data.lblod.info/id/gestructureerdeIdentificatoren/${testUuid('version', 2)}`;
+  const named = parses(proposedIdentifiersQuery({ pairs: [{ structured, structuredVersion: version }], predicates: identifierPredicates }));
+  assert.ok(named.includes(`VALUES (?structured ?structuredVersion) { (<${structured}> <${version}>) }`));
+  assert.ok(named.includes('?submission prov:generated ?identifierVersion, ?structuredVersion .'), 'the identifier and its structured identifier of one submission');
+  const names = parses(identifierNamesQuery({ structuredUris: [URIS.structuredKbo], predicates: identifierPredicates, idClass: `${NS.adms}Identifier` }));
+  assert.ok(names.includes(`VALUES ?structured { <${URIS.structuredKbo}> }`) && names.includes(`a <${NS.adms}Identifier> .`), 'identifiers of the register, not versions');
+});
+
+test('the read-backs of a submission and of an apply are anchored queries that parse', () => {
+  const triple = { subject: `<${URIS.org}>`, predicate: `<${NS.skos}prefLabel>`, object: '"""Stad Aalst"""' };
+  assert.ok(parses(existingTriplesQuery({ triples: [triple] })).includes(`VALUES (?s ?p ?o) { (<${URIS.org}> <${NS.skos}prefLabel> """Stad Aalst""") }\n  ?s ?p ?o .`));
+  const leftovers = parses(leftoversQuery({ uris: [URIS.oldContact], incoming: [`${NS.org}siteAddress`] }));
+  assert.ok(leftovers.includes(`VALUES ?record { <${URIS.oldContact}> }\n    VALUES ?p { <${NS.org}siteAddress> }\n    ?s ?p ?record .`));
+  assert.ok(!parses(leftoversQuery({ uris: [URIS.oldContact], incoming: [] })).includes('UNION'));
+  assert.ok(parses(storedStepsQuery({ steps: [approval, handling] })).includes(`(<${handling.uri}> <${STATUS.afgehandeld}>)`));
+  assert.ok(parses(storedSubmissionQuery({ request, step: submission })).includes(`<${submission.uri}> prov:generated ?version .`));
 });
 
 test('a creation of a subtype writes every class of its class tree', () => {
   const created = buildVersions({
-    operations: [{ op: 'create', data: { type: 'addresses', lid: 'a1', attributes: { street: 'x' } } }],
+    operations: [
+      { op: 'create', data: { type: 'addresses', lid: 'a1', attributes: { street: 'x' } } },
+      { op: 'update', data: { type: 'sites', id: IDS.site, relationships: { address: { data: { type: 'addresses', lid: 'a1' } } } } },
+    ],
     aggregateName: 'site', aggregate: config.aggregates.site, model, mintUuid: uuidSequence(), resources, reachable, target,
   });
   const query = applyQuery({ request, step: approval, versions: created.versions, model, graphs });
