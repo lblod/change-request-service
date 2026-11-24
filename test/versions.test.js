@@ -73,7 +73,7 @@ test('the aggregate whitelist admits subtypes of its types, the relationships be
   assert.deepEqual(aggregatePredicates(model, aggregate, 'sites'), [`${NS.dct}description`, `${NS.ere}vestigingstype`, `${NS.org}siteAddress`, `${NS.organisatie}bestaatUit`].sort());
 });
 
-test('pathPredicates are the links from the target to the records of its aggregate, organisations excluded', () => {
+test('pathPredicates are the links from the target to the records of its aggregate', () => {
   assert.deepEqual(pathPredicates(model, aggregate), [
     `${NS.schema}contactPoint`,
     `${NS.org}hasPrimarySite`,
@@ -92,6 +92,27 @@ test('pathPredicates are the links from the target to the records of its aggrega
     `${NS.locn}address`,
     `${NS.organisatie}bestaatUit`,
   ].sort());
+  // A membership stores its links to the organisation: follow them from the organisation to the
+  // membership, and from there to its period.
+  assert.deepEqual(pathPredicates(model, config.aggregates['related-organizations']), [
+    `^${NS.org}member`,
+    `^${NS.org}organization`,
+    'http://data.europa.eu/m8g/memberDuring',
+  ].sort());
+  // A change event and its result store their link to the organisation; the activity stores its
+  // link to the decision, which the aggregate's "reverse" follows as well.
+  assert.deepEqual(pathPredicates(model, config.aggregates['change-event-edit']), [
+    `^${NS.org}originalOrganization`,
+    `^${NS.org}resultingOrganization`,
+    '^http://mu.semte.ch/vocabularies/ext/resultingOrganization',
+    `^${NS.prov}generated`,
+    'http://data.europa.eu/m8g/hasFormalFramework',
+    'http://lblod.data.gift/vocabularies/organisatie/veranderingsgebeurtenisResultaat',
+    `${NS.prov}generated`,
+  ].sort());
+  // A link from one organisation to another is not followed: an organisation is never part of
+  // another organisation's aggregate (the kbo-organization's sameAs link).
+  assert.ok(!pathPredicates(model, aggregate).some((predicate) => predicate.includes('sameAs')));
 });
 
 test('builds one version per operation with fresh URIs, master URIs, typed triples and the predicates each replaces', () => {
@@ -226,6 +247,51 @@ test('an id that does not belong to the target organisation is refused, as opera
   assert.deepEqual(objects(versions[0], `${NS.ere}vestigingstype`), [`<${URIS.siteType}>`]);
 });
 
+test('an edit of an existing membership and period reaches them from the organisation', () => {
+  const membershipId = '22222222-2222-4222-8222-222222222222';
+  const periodId = '33333333-3333-4333-8333-333333333333';
+  const membershipUri = 'http://data.lblod.info/id/lidmaatschappen/1';
+  const periodUri = 'http://data.lblod.info/id/periodes/1';
+  const roleId = '11111111-1111-4111-8111-111111111111';
+  const roleUri = 'http://data.lblod.info/id/rollen/1';
+  const editResources = new Map([
+    ...resources,
+    [membershipId, { uri: membershipUri, classes: [model.get('memberships').class] }],
+    [periodId, { uri: periodUri, classes: [model.get('periods-of-time').class] }],
+    [roleId, { uri: roleUri, classes: [model.get('membership-roles').class] }],
+  ]);
+  // what reachableFromTarget answers for the target over the aggregate's paths
+  const membershipReachable = new Set([URIS.org, membershipUri, periodUri]);
+  const options = {
+    aggregateName: 'related-organizations',
+    aggregate: config.aggregates['related-organizations'],
+    model,
+    mintUuid: uuidSequence(),
+    resources: editResources,
+    reachable: membershipReachable,
+    target,
+  };
+
+  const { versions } = buildVersions({
+    ...options,
+    operations: [
+      { op: 'update', data: { type: 'periods-of-time', id: periodId, attributes: { 'end-date': '2021-01-01' } } },
+      { op: 'update', data: { type: 'memberships', id: membershipId, relationships: { role: { data: { type: 'membership-roles', id: roleId } } } } },
+    ],
+  });
+  assert.deepEqual(versions.map((version) => version.type), ['periods-of-time', 'memberships']);
+  assert.equal(versions[1].masterUri, membershipUri);
+
+  const { versions: deletions } = buildVersions({
+    ...options,
+    operations: [
+      { op: 'delete', data: { type: 'memberships', id: membershipId } },
+      { op: 'delete', data: { type: 'periods-of-time', id: periodId } },
+    ],
+  });
+  assert.ok(deletions.every((version) => version.deleted));
+});
+
 test('an organisation is only ever updated, and only the target itself', () => {
   expect422([{ op: 'delete', data: { type: 'administrative-units', id: IDS.org } }], /an organisation cannot be deleted through a change request; only "update" of the target is allowed/);
   assert.throws(() => build([{ op: 'delete', data: { type: 'administrative-units', id: IDS.org } }]), { pointer: '/data/attributes/operations/0/op' });
@@ -235,6 +301,42 @@ test('an organisation is only ever updated, and only the target itself', () => {
   assert.throws(() => build([{ op: 'update', data: { type: 'organizations', id: IDS.abb, attributes: { name: 'pwned' } } }]), { pointer: '/data/attributes/operations/0/data/id' });
   const { versions } = build([{ op: 'update', data: { type: 'organizations', id: IDS.org, attributes: { name: 'Stad Aalst' } } }]);
   assert.equal(versions[0].masterUri, URIS.org);
+});
+
+test('a record may link another organisation, which is never operated on', () => {
+  // the related-organizations aggregate: a new membership of the target links the related
+  // organisation, which is not part of the target's aggregate but may be linked
+  const roleId = '11111111-1111-4111-8111-111111111111';
+  const roleUri = 'http://data.lblod.info/id/rollen/1';
+  const relatedResources = new Map([...resources, [roleId, { uri: roleUri, classes: [model.get('membership-roles').class] }]]);
+  const { versions } = buildVersions({
+    operations: [
+      { op: 'create', data: { type: 'periods-of-time', lid: 'p1', attributes: { 'start-date': '2020-01-01' } } },
+      {
+        op: 'create',
+        data: {
+          type: 'memberships',
+          lid: 'm1',
+          relationships: {
+            organization: { data: { type: 'organizations', id: IDS.org } },
+            member: { data: { type: 'organizations', id: IDS.orgB } },
+            role: { data: { type: 'membership-roles', id: roleId } },
+            during: { data: { type: 'periods-of-time', lid: 'p1' } },
+          },
+        },
+      },
+    ],
+    aggregateName: 'related-organizations',
+    aggregate: config.aggregates['related-organizations'],
+    model,
+    mintUuid: uuidSequence(),
+    resources: relatedResources,
+    reachable,
+    target,
+  });
+  const membership = versions.find((version) => version.type === 'memberships');
+  assert.deepEqual(objects(membership, `${NS.org}member`), [`<${URIS.orgB}>`]);
+  assert.deepEqual(objects(membership, `${NS.org}organization`), [`<${URIS.org}>`]);
 });
 
 test('a relationship outside the aggregate is kept for the unchanged check, refused on a create or with a lid', () => {

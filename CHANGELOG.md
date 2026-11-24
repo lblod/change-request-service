@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- A record may link an organisation that is not the target, and only link it: an organisation is never part of another organisation's aggregate, so only its existence is checked (a membership's `member`, a merger's result), while an organisation document is still only ever the target. The `related-organizations` aggregate relies on this to link its memberships.
+- An edit reaches the records that store their link to the organisation: the reachability query follows a membership's `org:member`/`org:organization`, a change event's `org:originalOrganization`/`org:resultingOrganization` and a result's `ext:resultingOrganization` from the organisation to the record, and an aggregate's new `reverse` field adds the inverse of a link between its own records (`decision-activities.gives-cause-to`, from a decision to its activity). An edit of an existing membership, period, change event or decision activity therefore finds its records instead of answering 422.
+
 ## 0.2.0
 
 - The validation flow of the designs (review of 19 October 2026): aggregates have a `kind` (`edit`, `creation`, `change-event`); an edit is applied at once (a conflict refuses it with 409 and its conflicts, nothing is held), a request to register a new organisation (`new-organisation`: the organisation is minted as the target, exists in the request only until approval, needs a KBO number the register and the pending creations do not hold, and is allowed per `creatableClassifications`, the "Wie beheert" table) or a veranderingsgebeurtenis (`change-event`, including the organisation's resulting fields) waits for ABB; what ABB requests itself is applied at once. `holdOnConflict` is gone. `new-organisation` operates on `change-event-results` too: the oprichting carries its result (the status the organisation starts with), which is what the organisation's veranderingsgebeurtenissen page lists.

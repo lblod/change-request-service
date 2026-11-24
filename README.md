@@ -173,8 +173,10 @@ carry its base in `meta.base`:
     "relationships": { "target": { "data": { "type": "organizations", "id": "9a01…" } } } } }
 ```
 
-Rules in one breath: every id must belong to the target's aggregate; an organisation is only ever
-updated, and only the target itself, except that a creation creates exactly one; a create carries a
+Rules in one breath: every id a request operates on, and every id it links inside the aggregate,
+must belong to the target's aggregate; an organisation is only ever updated, and only the target
+itself, while another organisation may be linked (a membership's `member`, a merger's result) but
+never operated on, except that a creation creates exactly one; a create carries a
 `lid` that other operations may point at, and must be linked to the organisation through the
 records of the request; a field the aggregate may not change (a relationship outside it, a field
 its `writable` leaves out) may be carried but not changed; a creation has no target and carries
@@ -265,7 +267,11 @@ The sparql-parser configuration and the facts it rests on are in
       "writable": { "organizations": ["sites", "primary-site"] } },
     "new-organisation": { "kind": "creation", "root": "organizations", "members": ["identifiers", "structured-identifiers", "sites", "addresses", "contact-points", "change-events", "change-event-results", "decisions"], "references": ["organization-classification-codes", "organization-status-codes", "concepts", "locations", "site-types", "change-event-types"] },
     "change-event": { "kind": "change-event", "root": "change-events", "members": ["change-event-results", "decisions", "decision-activities", "organizations"], "references": ["change-event-types", "organization-status-codes", "concepts", "locations"],
-      "writable": { "organizations": ["name", "legal-name", "organization-status", "legal-form", "scope", "additional-qualifications"] } }
+      "writable": { "organizations": ["name", "legal-name", "organization-status", "legal-form", "scope", "additional-qualifications"] } },
+    "related-organizations": { "kind": "edit", "root": "organizations", "members": ["memberships", "periods-of-time"], "references": ["membership-roles"],
+      "writable": { "organizations": [] } },
+    "change-event-edit": { "kind": "edit", "root": "change-events", "members": ["change-event-results", "decisions", "decision-activities", "organizations"], "references": ["change-event-types", "organization-status-codes", "concepts", "locations"],
+      "writable": { "organizations": ["name", "legal-name"] }, "reverse": ["decision-activities.gives-cause-to"] }
   },
   "registration": {
     "types": { "administrative-units": ["<gemeente>", "<AGB>", "<ILV>", "…"], "registered-organizations": ["<ziekenhuisvereniging>", "<zorgraad>", "…"] },
@@ -282,14 +288,21 @@ An aggregate is a whitelist: `root` and `members` are the types a request may cr
 delete; `references` are code lists a record may link to but never change; `kind` (required) says
 whether it is an `edit` (applied at once), a `creation` (a new organisation, whose root must be the
 organisation type) or a `change-event`. `writable` narrows, per type, the fields the aggregate may
-change on a record that exists; any other field may be carried, but unchanged. `registration` lists
+change on a record that exists; any other field may be carried, but unchanged. A record that stores
+its link to the organisation (a membership's `member`, a change event's original or resulting
+organisation) belongs to the target's aggregate through that link; `reverse` lists
+`type.relationship` pairs between records of the aggregate whose inverse the service follows too
+(the decision activity that points at its decision). `registration` lists
 every classification the service registers, by the resource type it registers it as (ABB may
 request all of them), the change-event type of the oprichting every creation carries, and the
 classifications registered without a KBO number. `creatableClassifications` is the "Wie beheert"
 table: which classification an organisation may request, by the classification it has itself.
 `pendingVisibleTo` (required) is `everyone` or `involved`: who sees a request that still waits.
-Nothing has a default that widens what a request may do: a missing `kind` or `pendingVisibleTo` stops
-the service at start-up. app-lokale-verkenner keeps the same file in
+The operations are applied in the order they are listed, so a create comes before the record that
+links it; a new record is linked from the side the backend stores the link on, since an inverse
+relationship of a create is not written (a change event's `results`, a decision activity's
+`gives-cause-to`). Nothing has a default that widens what a request may do: a missing `kind` or
+`pendingVisibleTo` stops the service at start-up. app-lokale-verkenner keeps the same file in
 `config/change-requests/change-requests.json`; the two copies must be equal. A new field only needs
 the resources model and the frontend (and the `writable` list of its aggregate, where it has one); a
 new type is added to its aggregate.

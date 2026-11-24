@@ -183,6 +183,14 @@ test('the configuration is checked against the model: unknown types and referenc
   assert.deepEqual(loadConfig(write({ ...base, aggregates: site({ writable: { organizations: ['sites', 'scope'] } }) }), model).aggregates.site.writable, { organizations: ['sites', 'scope'] });
   assert.throws(() => loadConfig(write({ ...base, aggregates: site({ writable: { locations: ['label'] } }) }), model), /"writable" names "locations", which is not a type the aggregate operates on/);
   assert.throws(() => loadConfig(write({ ...base, aggregates: site({ writable: { organizations: ['colour'] } }) }), model), /"writable.organizations" names "colour"/);
+  // reverse: links between the aggregate's own types whose inverse the service follows as well
+  assert.deepEqual(loadConfig(write({ ...base, aggregates: site({ reverse: ['sites.address'] }) }), model).aggregates.site.reverse, ['sites.address']);
+  assert.throws(() => loadConfig(write({ ...base, aggregates: site({ reverse: 'sites.address' }) }), model), /"reverse" must be an array/);
+  assert.throws(() => loadConfig(write({ ...base, aggregates: site({ reverse: ['sites.colour'] }) }), model), /sites has no relationship "colour"/);
+  assert.throws(() => loadConfig(write({ ...base, aggregates: site({ reverse: ['organizations.memberships'] }) }), model), /already the inverse side/);
+  assert.throws(() => loadConfig(write({ ...base, aggregates: site({ reverse: ['organizations.sites'] }) }), model), /links an organisation/);
+  assert.throws(() => loadConfig(write({ ...base, aggregates: site({ reverse: ['sites.site-type'] }) }), model), /outside the aggregate/);
+  assert.throws(() => loadConfig(write({ ...base, aggregates: site({ reverse: ['locations.label'] }) }), model), /not a type the aggregate operates on/);
   // registration: required by a creation, its types organisations the creation creates, every classification once
   const creation = { 'new-organisation': { kind: 'creation', root: 'organizations', members: ['identifiers'], references: ['organization-classification-codes'] } };
   const registration = { types: { 'administrative-units': ['http://example.org/agb'], 'registered-organizations': ['http://example.org/zorgraad'] }, foundingEventType: 'http://example.org/oprichting' };

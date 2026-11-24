@@ -33,10 +33,14 @@ straight away.
    number the request proposes.
 6. **Look up records.** The records the operations and their bases name, and the target's
    aggregate: everything reachable from the target over the relationships between the aggregate's
-   types (`org:hasSite`, `org:hasPrimarySite`, `org:siteAddress`, `locn:address`, `adms:identifier`,
-   `generiek:gestructureerdeIdentificator`, `schema:contactPoint` for the kerngegevens;
-   `org:originalOrganization`, `code:veranderingsgebeurtenisResultaat`, `m8g:hasFormalFramework`
-   for a change event). A base may name a record deleted since; it is found through its versions.
+   types, following a link that a record stores to the organisation in reverse (a membership's
+   `org:member`/`org:organization`, a change event's `org:originalOrganization`/
+   `org:resultingOrganization`, a result's `ext:resultingOrganization`), and the aggregate's
+   `reverse` links (`prov:generated` from a decision to its activity). The forward links are
+   `org:hasSite`, `org:hasPrimarySite`, `org:siteAddress`, `locn:address`, `adms:identifier`,
+   `generiek:gestructureerdeIdentificator`, `schema:contactPoint` for the kerngegevens and
+   `code:veranderingsgebeurtenisResultaat`, `m8g:hasFormalFramework` for a change event. A base may
+   name a record deleted since; it is found through its versions.
 7. **Build versions.** One per operation: an update takes the record from its id, a create mints a
    uuid and a URI from the type's `new-resource-base` (the organisation of a creation keeps the one
    minted in step 2), a delete gives a tombstone that removes every field of its type. Anything
@@ -241,7 +245,8 @@ the request, which ABB overrides knowingly or not at all (see the steps).
   relationship inside the aggregate points at, must be reachable from the target organisation over
   the aggregate's relationships. Anything else is a 422, for ABB too. A record that is no longer
   linked to the organisation is no longer part of its aggregate, so unlink and delete in the same
-  request, as the pages do. References only have to exist.
+  request, as the pages do. References and organisations only have to exist: an organisation other
+  than the target may be linked (a membership's `member`, a merger's result), never operated on.
 - **An organisation is only ever updated, and only the target itself.** Creating or deleting an
   organisation, or updating another one, is a 422. The exception is a creation, which creates
   exactly one organisation (and updates none): the document must be a create with a `lid`; its
