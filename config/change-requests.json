@@ -32,6 +32,25 @@
       "writable": {
         "organizations": ["name", "legal-name", "organization-status", "legal-form", "scope", "additional-qualifications"]
       }
+    },
+    "related-organizations": {
+      "kind": "edit",
+      "root": "organizations",
+      "members": ["memberships", "periods-of-time"],
+      "references": ["membership-roles"],
+      "writable": {
+        "organizations": []
+      }
+    },
+    "change-event-edit": {
+      "kind": "edit",
+      "root": "change-events",
+      "members": ["change-event-results", "decisions", "decision-activities", "organizations"],
+      "references": ["change-event-types", "organization-status-codes", "concepts", "locations"],
+      "writable": {
+        "organizations": ["name", "legal-name"]
+      },
+      "reverse": ["decision-activities.gives-cause-to"]
     }
   },
   "registration": {
